@@ -10,6 +10,7 @@ agent integration, federation, and the biological properties we care about:
     - Cross-bot knowledge sharing
 """
 
+import asyncio
 import tempfile
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -21,6 +22,7 @@ from ganglion.memory.backends.federated import FederatedMemoryBackend, PeerDisco
 from ganglion.memory.backends.json_file import JsonMemoryBackend
 from ganglion.memory.backends.sqlite import SqliteMemoryBackend
 from ganglion.memory.loop import MemoryLoop
+from ganglion.memory.similarity import jaccard_similarity, tokenize
 from ganglion.memory.types import Belief, Delta, Observation, Valence
 
 
@@ -37,15 +39,20 @@ def json_backend(tmp_dir):
 
 @pytest.fixture
 def sqlite_backend(tmp_dir):
-    return SqliteMemoryBackend(tmp_dir / "memory.db")
+    backend = SqliteMemoryBackend(tmp_dir / "memory.db")
+    yield backend
+    backend.close()
 
 
 @pytest.fixture(params=["json", "sqlite"])
 def backend(request, tmp_dir):
     """Run every backend test against both JSON and SQLite."""
     if request.param == "json":
-        return JsonMemoryBackend(tmp_dir / "memory")
-    return SqliteMemoryBackend(tmp_dir / "memory.db")
+        yield JsonMemoryBackend(tmp_dir / "memory")
+    else:
+        b = SqliteMemoryBackend(tmp_dir / "memory.db")
+        yield b
+        b.close()
 
 
 @pytest.fixture
@@ -138,6 +145,60 @@ class TestTypes:
             delta_type="contradiction",
         )
         assert "contradicted" in d.summary
+
+    def test_long_term_memory_consolidation(self):
+        """Consolidated beliefs (high confirmation_count) resist recency decay."""
+        old_consolidated = Belief(
+            capability="x", description="consolidated",
+            valence=Valence.POSITIVE,
+            confidence=5.0, confirmation_count=10,
+            last_confirmed=datetime.now(UTC) - timedelta(days=60),
+        )
+        new_weak = Belief(
+            capability="x", description="new",
+            valence=Valence.POSITIVE,
+            confidence=1.0, confirmation_count=1,
+            last_confirmed=datetime.now(UTC),
+        )
+        # With consolidation floor (0.5), old belief strength = 5.0 * 10 * 0.5 = 25.0
+        # New belief strength = 1.0 * 1 * ~1.0 = ~1.0
+        assert old_consolidated.strength > new_weak.strength
+        # Verify the floor is in effect (without floor, recency ~0.10 for 60 days)
+        assert old_consolidated.strength >= 5.0 * 10 * 0.5
+
+
+# ======================================================================
+# Similarity
+# ======================================================================
+
+class TestSimilarity:
+    def test_identical_strings(self):
+        assert jaccard_similarity("batch_size=64 works", "batch_size=64 works") == 1.0
+
+    def test_similar_strings(self):
+        score = jaccard_similarity(
+            "batch_size=64 works well for training",
+            "batch 64 works well for training runs"
+        )
+        assert score > 0.7
+
+    def test_dissimilar_strings(self):
+        score = jaccard_similarity(
+            "batch_size=64 works",
+            "learning_rate=0.001 is optimal"
+        )
+        assert score < 0.3
+
+    def test_empty_string(self):
+        assert jaccard_similarity("", "anything") == 0.0
+
+    def test_tokenize(self):
+        tokens = tokenize("batch_size=64 Works WELL")
+        assert "batch" in tokens
+        assert "size" in tokens
+        assert "64" in tokens
+        assert "works" in tokens
+        assert "well" in tokens
 
 
 # ======================================================================
@@ -245,6 +306,76 @@ class TestBackend:
         results = await backend.query(tags=("agent_design",))
         assert len(results) == 1
         assert results[0].description == "A"
+
+    async def test_sqlite_roundtrip_all_beliefs(self, sqlite_backend):
+        """SQLite store + all_beliefs roundtrip (covers _row_to_belief UTC fix)."""
+        belief = Belief(
+            capability="mining", description="test roundtrip",
+            valence=Valence.POSITIVE, confidence=2.0,
+            confirmation_count=3, entities=("sn18",),
+            metric_value=0.9, metric_name="score",
+            source="alpha", tags=("tag1",),
+        )
+        await sqlite_backend.store(belief)
+        beliefs = await sqlite_backend.all_beliefs()
+        assert len(beliefs) == 1
+        b = beliefs[0]
+        assert b.description == "test roundtrip"
+        assert b.confidence == 2.0
+        assert b.confirmation_count == 3
+        assert b.first_seen is not None
+        assert b.last_confirmed is not None
+
+    async def test_find_similar_fuzzy_match(self, backend):
+        """Token-based similarity matches rephrased descriptions."""
+        await backend.store(Belief(
+            capability="train",
+            description="batch_size=64 works well for training",
+            valence=Valence.POSITIVE,
+        ))
+
+        obs = Observation(
+            capability="train",
+            description="batch 64 works well for training runs",
+            valence=Valence.POSITIVE,
+        )
+        # Jaccard score ~0.75, so use a lower threshold
+        found = await backend.find_similar(obs, threshold=0.7)
+        assert found is not None
+
+    async def test_find_similar_no_match_dissimilar(self, backend):
+        """Dissimilar descriptions don't match."""
+        await backend.store(Belief(
+            capability="train",
+            description="batch_size=64 works",
+            valence=Valence.POSITIVE,
+        ))
+
+        obs = Observation(
+            capability="train",
+            description="learning_rate=0.001 is optimal",
+            valence=Valence.POSITIVE,
+        )
+        found = await backend.find_similar(obs)
+        assert found is None
+
+    async def test_find_similar_lower_threshold(self, backend):
+        """Lowering threshold allows fuzzier matches."""
+        await backend.store(Belief(
+            capability="train",
+            description="batch_size=64 works great",
+            valence=Valence.POSITIVE,
+        ))
+
+        obs = Observation(
+            capability="train",
+            description="batch 64 great results observed",
+            valence=Valence.POSITIVE,
+        )
+        # Default threshold (0.85) might miss this
+        found_loose = await backend.find_similar(obs, threshold=0.3)
+        # Loose threshold should find it
+        assert found_loose is not None
 
 
 # ======================================================================
@@ -380,6 +511,131 @@ class TestMemoryLoop:
         descriptions = {b.description for b in remaining}
         assert "b0" not in descriptions
         assert "b1" not in descriptions
+
+    async def test_metric_shift_delta_snapshots_old_value(self, loop):
+        """Delta.old_belief captures pre-mutation state for metric shifts."""
+        loop.metric_shift_threshold = 0.1
+
+        obs1 = Observation(
+            capability="mining", description="batch=64",
+            valence=Valence.POSITIVE, metric_name="score", metric_value=0.8,
+        )
+        obs2 = Observation(
+            capability="mining", description="batch=64",
+            valence=Valence.POSITIVE, metric_name="score", metric_value=0.5,
+        )
+
+        await loop.assimilate(obs1)
+        delta = await loop.assimilate(obs2)
+
+        assert delta is not None
+        # old_belief should reflect pre-mutation state
+        assert delta.old_belief.metric_value == 0.8
+        # Stored belief should have the new value
+        beliefs = await loop.backend.all_beliefs()
+        assert beliefs[0].metric_value == 0.5
+
+    async def test_contradiction_delta_snapshots_old_confidence(self, loop):
+        """Delta.old_belief captures pre-mutation state for contradictions."""
+        pos = Observation(
+            capability="mining", description="batch=64",
+            valence=Valence.POSITIVE,
+        )
+        neg = Observation(
+            capability="mining", description="batch=64",
+            valence=Valence.NEGATIVE,
+        )
+
+        await loop.assimilate(pos)  # confidence=1.0
+        delta = await loop.assimilate(neg)
+
+        assert delta is not None
+        assert delta.old_belief.confidence == 1.0  # snapshot before weakening
+
+    async def test_metric_shift_does_not_strengthen(self, loop):
+        """Metric shift in agreement branch should not increase confidence/count."""
+        loop.metric_shift_threshold = 0.1
+
+        obs1 = Observation(
+            capability="mining", description="batch=64",
+            valence=Valence.POSITIVE, metric_name="score", metric_value=0.85,
+        )
+        obs2 = Observation(
+            capability="mining", description="batch=64",
+            valence=Valence.POSITIVE, metric_name="score", metric_value=0.45,
+        )
+
+        await loop.assimilate(obs1)
+        delta = await loop.assimilate(obs2)
+
+        assert delta is not None
+        assert delta.delta_type == "metric_shift"
+
+        beliefs = await loop.backend.all_beliefs()
+        b = beliefs[0]
+        # Should NOT have been strengthened
+        assert b.confidence <= 1.0  # not increased from initial 1.0
+        assert b.confirmation_count == 1  # not bumped to 2
+
+    async def test_stable_entity_merge_order(self, loop):
+        """Entity merging preserves existing order, appends new items."""
+        obs1 = Observation(
+            capability="mining", description="test order",
+            valence=Valence.POSITIVE, entities=("a", "b", "c"),
+        )
+        obs2 = Observation(
+            capability="mining", description="test order",
+            valence=Valence.POSITIVE, entities=("d", "b", "e"),
+        )
+
+        await loop.assimilate(obs1)
+        await loop.assimilate(obs2)
+
+        beliefs = await loop.backend.all_beliefs()
+        assert beliefs[0].entities == ("a", "b", "c", "d", "e")
+
+    async def test_concurrent_delta_safety(self, loop):
+        """Concurrent assimilate calls produce correct delta counts."""
+        loop.metric_shift_threshold = 0.01
+
+        # First, create a base belief
+        base_obs = Observation(
+            capability="mining", description="concurrent test",
+            valence=Valence.POSITIVE, metric_name="score", metric_value=1.0,
+        )
+        await loop.assimilate(base_obs)
+
+        # Create 10 contradicting observations to generate deltas
+        for i in range(10):
+            obs = Observation(
+                capability=f"cap_{i}",
+                description=f"unique obs {i}",
+                valence=Valence.POSITIVE,
+                metric_name="score",
+                metric_value=0.5,
+            )
+            # First assimilate to create belief
+            await loop.assimilate(obs)
+
+        # Now create contradictions concurrently
+        async def make_contradiction(idx: int) -> Delta | None:
+            obs = Observation(
+                capability=f"cap_{idx}",
+                description=f"unique obs {idx}",
+                valence=Valence.NEGATIVE,
+            )
+            return await loop.assimilate(obs)
+
+        results = await asyncio.gather(*[make_contradiction(i) for i in range(10)])
+        contradiction_deltas = [r for r in results if r is not None]
+
+        # All 10 should produce contradiction deltas
+        assert len(contradiction_deltas) == 10
+
+        # drain_deltas should have all of them
+        drained = await loop.drain_deltas()
+        assert len(drained) == 10
+        assert len(await loop.drain_deltas()) == 0  # second drain empty
 
 
 # ======================================================================
@@ -609,3 +865,684 @@ class TestFederation:
         descriptions = {b.description for b in results}
         assert "Beta" in descriptions
         assert "Alpha" not in descriptions
+
+
+# ======================================================================
+# JSON backend cache
+# ======================================================================
+
+@pytest.mark.asyncio
+class TestJsonCache:
+    async def test_cache_returns_same_data(self, json_backend):
+        """After storing, all_beliefs() uses cache on second call."""
+        for i in range(3):
+            await json_backend.store(Belief(
+                capability="x", description=f"b{i}", valence=Valence.POSITIVE,
+            ))
+
+        result1 = await json_backend.all_beliefs()
+        result2 = await json_backend.all_beliefs()
+        assert len(result1) == 3
+        assert len(result2) == 3
+        assert {b.description for b in result1} == {b.description for b in result2}
+
+    async def test_invalidate_cache(self, json_backend):
+        """invalidate_cache forces re-read from disk."""
+        await json_backend.store(Belief(
+            capability="x", description="cached", valence=Valence.POSITIVE,
+        ))
+        json_backend.invalidate_cache()
+        beliefs = await json_backend.all_beliefs()
+        assert len(beliefs) == 1
+        assert beliefs[0].description == "cached"
+
+
+# ======================================================================
+# Salience (built into MemoryLoop.assimilate)
+# ======================================================================
+
+@pytest.mark.asyncio
+class TestSalience:
+    async def test_novel_surprising_observation_gets_boosted(self, loop):
+        """Novel observation with surprising metric gets confidence > 1.0."""
+        # Seed peers so salience has data
+        for i in range(5):
+            await loop.assimilate(Observation(
+                capability="mining", description=f"peer_{i}",
+                valence=Valence.POSITIVE, metric_value=0.5 + i * 0.01,
+            ))
+
+        # Novel observation with outlier metric
+        obs = Observation(
+            capability="mining", description="outlier strategy",
+            valence=Valence.POSITIVE, metric_value=0.99,
+        )
+        delta = await loop.assimilate(obs)
+        assert delta is None  # novel
+
+        beliefs = await loop.backend.all_beliefs()
+        outlier = next(b for b in beliefs if b.description == "outlier strategy")
+        assert outlier.confidence > 1.0
+
+    async def test_salience_disabled(self, loop):
+        """With salience=False, novel observations get confidence=1.0."""
+        loop.salience = False
+        for i in range(5):
+            await loop.assimilate(Observation(
+                capability="mining", description=f"peer_{i}",
+                valence=Valence.POSITIVE, metric_value=0.5 + i * 0.01,
+            ))
+
+        obs = Observation(
+            capability="mining", description="outlier strategy",
+            valence=Valence.POSITIVE, metric_value=0.99,
+        )
+        await loop.assimilate(obs)
+
+        beliefs = await loop.backend.all_beliefs()
+        outlier = next(b for b in beliefs if b.description == "outlier strategy")
+        assert outlier.confidence == 1.0
+
+    async def test_agreement_preserves_hebbian_not_salience(self, loop):
+        """Repeated agreement uses Hebbian strengthening, not salience."""
+        obs = Observation(
+            capability="mining", description="batch=64",
+            valence=Valence.POSITIVE, metric_value=0.8,
+        )
+        await loop.assimilate(obs)
+        await loop.assimilate(obs)
+
+        beliefs = await loop.backend.all_beliefs()
+        assert len(beliefs) == 1
+        assert beliefs[0].confirmation_count == 2
+
+    async def test_no_metric_gets_baseline(self, loop):
+        """Observation without metric_value gets confidence=1.0."""
+        obs = Observation(
+            capability="mining", description="no metric",
+            valence=Valence.POSITIVE,
+        )
+        await loop.assimilate(obs)
+
+        beliefs = await loop.backend.all_beliefs()
+        assert beliefs[0].confidence == 1.0
+
+    async def test_too_few_peers_gets_baseline(self, loop):
+        """Fewer than 2 peer metrics → confidence=1.0."""
+        await loop.assimilate(Observation(
+            capability="mining", description="only peer",
+            valence=Valence.POSITIVE, metric_value=0.8,
+        ))
+
+        obs = Observation(
+            capability="mining", description="new one",
+            valence=Valence.POSITIVE, metric_value=0.99,
+        )
+        await loop.assimilate(obs)
+
+        beliefs = await loop.backend.all_beliefs()
+        new = next(b for b in beliefs if b.description == "new one")
+        assert new.confidence == 1.0
+
+
+# ======================================================================
+# Inhibition (built into MemoryLoop.assimilate)
+# ======================================================================
+
+@pytest.mark.asyncio
+class TestInhibition:
+    async def test_agreement_weakens_competitors(self, loop):
+        """Agreement on one belief weakens competitors with overlapping features."""
+        # Create two competing beliefs directly
+        await loop.backend.store(Belief(
+            capability="mining", description="batch=64",
+            valence=Valence.POSITIVE, entities=("subnet-18",),
+            confidence=1.0, confirmation_count=1,
+        ))
+        await loop.backend.store(Belief(
+            capability="mining", description="batch=128",
+            valence=Valence.POSITIVE, entities=("subnet-18",),
+            confidence=1.0, confirmation_count=1,
+        ))
+
+        # Agree with batch=64 — should inhibit batch=128
+        obs = Observation(
+            capability="mining", description="batch=64",
+            valence=Valence.POSITIVE, entities=("subnet-18",),
+        )
+        await loop.assimilate(obs)
+
+        beliefs = await loop.backend.all_beliefs()
+        comp = next(b for b in beliefs if b.description == "batch=128")
+        assert comp.confidence < 1.0
+
+    async def test_same_description_not_inhibited(self, loop):
+        """Same-description beliefs are allies, not competitors."""
+        await loop.backend.store(Belief(
+            capability="mining", description="batch=64",
+            valence=Valence.POSITIVE, entities=("subnet-18",),
+            confidence=1.0, confirmation_count=1,
+        ))
+        await loop.backend.store(Belief(
+            capability="mining", description="batch=64",
+            valence=Valence.POSITIVE, entities=("subnet-18",),
+            confidence=1.0, confirmation_count=1,
+        ))
+
+        obs = Observation(
+            capability="mining", description="batch=64",
+            valence=Valence.POSITIVE, entities=("subnet-18",),
+        )
+        await loop.assimilate(obs)
+
+        beliefs = await loop.backend.all_beliefs()
+        # All beliefs with same description should be untouched by inhibition
+        for b in beliefs:
+            if b.description == "batch=64":
+                assert b.confidence >= 1.0
+
+    async def test_contradiction_does_not_inhibit(self, loop):
+        """Contradiction does NOT trigger inhibition."""
+        await loop.backend.store(Belief(
+            capability="mining", description="batch=64",
+            valence=Valence.POSITIVE, entities=("subnet-18",),
+            confidence=1.0, confirmation_count=1,
+        ))
+        await loop.backend.store(Belief(
+            capability="mining", description="batch=128",
+            valence=Valence.POSITIVE, entities=("subnet-18",),
+            confidence=1.0, confirmation_count=1,
+        ))
+
+        # Record batch=128 confidence before contradiction
+        beliefs_before = await loop.backend.all_beliefs()
+        alt_before = next(b for b in beliefs_before if b.description == "batch=128")
+        conf_before = alt_before.confidence
+
+        # Contradict batch=64
+        neg = Observation(
+            capability="mining", description="batch=64",
+            valence=Valence.NEGATIVE, entities=("subnet-18",),
+        )
+        delta = await loop.assimilate(neg)
+        assert delta is not None
+        assert delta.delta_type == "contradiction"
+
+        # batch=128 confidence should not have been reduced
+        beliefs_after = await loop.backend.all_beliefs()
+        alt_after = next(b for b in beliefs_after if b.description == "batch=128")
+        assert alt_after.confidence >= conf_before
+
+    async def test_inhibition_floor(self, loop):
+        """Inhibition cannot push confidence below the floor."""
+        loop.inhibition_floor = 0.2
+
+        await loop.backend.store(Belief(
+            capability="mining", description="batch=64",
+            valence=Valence.POSITIVE, entities=("subnet-18",),
+            confidence=1.0, confirmation_count=1,
+        ))
+        await loop.backend.store(Belief(
+            capability="mining", description="batch=256",
+            valence=Valence.POSITIVE, entities=("subnet-18",),
+            confidence=0.25, confirmation_count=1,
+        ))
+
+        obs = Observation(
+            capability="mining", description="batch=64",
+            valence=Valence.POSITIVE, entities=("subnet-18",),
+        )
+        await loop.assimilate(obs)
+
+        beliefs = await loop.backend.all_beliefs()
+        comp = next(b for b in beliefs if b.description == "batch=256")
+        assert comp.confidence >= 0.2
+
+    async def test_inhibition_disabled(self, loop):
+        """inhibition_rate=0.0 disables inhibition entirely."""
+        loop.inhibition_rate = 0.0
+
+        await loop.backend.store(Belief(
+            capability="mining", description="batch=64",
+            valence=Valence.POSITIVE, entities=("subnet-18",),
+            confidence=1.0, confirmation_count=1,
+        ))
+        await loop.backend.store(Belief(
+            capability="mining", description="batch=128",
+            valence=Valence.POSITIVE, entities=("subnet-18",),
+            confidence=1.0, confirmation_count=1,
+        ))
+
+        obs = Observation(
+            capability="mining", description="batch=64",
+            valence=Valence.POSITIVE, entities=("subnet-18",),
+        )
+        await loop.assimilate(obs)
+
+        beliefs = await loop.backend.all_beliefs()
+        comp = next(b for b in beliefs if b.description == "batch=128")
+        assert comp.confidence == 1.0  # untouched
+
+
+# ======================================================================
+# Consolidation (built into MemoryLoop.forget)
+# ======================================================================
+
+@pytest.mark.asyncio
+class TestConsolidation:
+    async def test_forget_merges_similar_cluster(self, loop):
+        """forget() merges similar beliefs before evicting."""
+        loop.max_beliefs = 1  # force eviction after consolidation
+        loop.consolidation_threshold = 0.5
+
+        for i in range(3):
+            await loop.backend.store(Belief(
+                capability="mining", description=f"strategy_{i}",
+                valence=Valence.POSITIVE,
+                entities=("subnet-18",), tags=("gpu",),
+                confirmation_count=1, confidence=1.0,
+                metric_value=0.8 + i * 0.01,
+                metric_name="score",
+            ))
+
+        await loop.forget()
+
+        remaining = await loop.backend.all_beliefs()
+        assert len(remaining) == 1
+        merged = remaining[0]
+        assert merged.confirmation_count == 3
+        assert "consolidated" in merged.tags
+        assert "subnet-18" in merged.entities
+
+    async def test_no_merge_below_jaccard_threshold(self, loop):
+        """Beliefs with no feature overlap don't merge."""
+        loop.max_beliefs = 100
+        loop.consolidation_threshold = 0.5
+
+        await loop.backend.store(Belief(
+            capability="mining", description="a",
+            valence=Valence.POSITIVE, entities=("A",),
+        ))
+        await loop.backend.store(Belief(
+            capability="mining", description="b",
+            valence=Valence.POSITIVE, entities=("B",),
+        ))
+        await loop.backend.store(Belief(
+            capability="mining", description="c",
+            valence=Valence.POSITIVE, entities=("C",),
+        ))
+
+        await loop.forget()
+        assert len(await loop.backend.all_beliefs()) == 3
+
+    async def test_seed_anchored_no_chaining(self, loop):
+        """A→B and B→C overlap, but A and C don't. No chain merge."""
+        loop.max_beliefs = 100
+        loop.consolidation_threshold = 0.5
+
+        await loop.backend.store(Belief(
+            capability="mining", description="a",
+            valence=Valence.POSITIVE, entities=("X", "Y"),
+        ))
+        await loop.backend.store(Belief(
+            capability="mining", description="b",
+            valence=Valence.POSITIVE, entities=("Y", "Z"),
+        ))
+        await loop.backend.store(Belief(
+            capability="mining", description="c",
+            valence=Valence.POSITIVE, entities=("Z", "W"),
+        ))
+
+        await loop.forget()
+        # No cluster of 3 formed — all 3 remain
+        assert len(await loop.backend.all_beliefs()) == 3
+
+    async def test_merged_entities_and_tags_sorted(self, loop):
+        """Merged belief has sorted entities and tags."""
+        loop.max_beliefs = 1
+        loop.consolidation_threshold = 0.3
+
+        await loop.backend.store(Belief(
+            capability="mining", description="a",
+            valence=Valence.POSITIVE,
+            entities=("C", "A"), tags=("beta", "alpha"),
+        ))
+        await loop.backend.store(Belief(
+            capability="mining", description="b",
+            valence=Valence.POSITIVE,
+            entities=("A", "B"), tags=("alpha", "gamma"),
+        ))
+        await loop.backend.store(Belief(
+            capability="mining", description="c",
+            valence=Valence.POSITIVE,
+            entities=("A", "C"), tags=("alpha", "beta"),
+        ))
+
+        await loop.forget()
+        remaining = await loop.backend.all_beliefs()
+        if len(remaining) == 1:
+            merged = remaining[0]
+            assert list(merged.entities) == sorted(merged.entities)
+            assert list(merged.tags) == sorted(merged.tags)
+
+
+# ======================================================================
+# Cross-agent confirmation weighting
+# ======================================================================
+
+@pytest.mark.asyncio
+class TestCrossAgentBonus:
+    async def test_cross_agent_confirmation_bonus(self, loop):
+        """Different-source confirmation strengthens more than same-source."""
+        # Agent alpha discovers something
+        await loop.assimilate(Observation(
+            capability="mining", description="batch=64 works",
+            valence=Valence.POSITIVE, source="alpha",
+        ))
+        beliefs = await loop.backend.all_beliefs()
+        confidence_after_1 = beliefs[0].confidence
+
+        # Alpha confirms its own finding
+        await loop.assimilate(Observation(
+            capability="mining", description="batch=64 works",
+            valence=Valence.POSITIVE, source="alpha",
+        ))
+        beliefs = await loop.backend.all_beliefs()
+        confidence_after_self = beliefs[0].confidence
+        self_boost = confidence_after_self - confidence_after_1
+
+        # Reset — start fresh
+        for b in await loop.backend.all_beliefs():
+            await loop.backend.remove(b)
+
+        # Agent alpha discovers again
+        await loop.assimilate(Observation(
+            capability="mining", description="batch=64 works",
+            valence=Valence.POSITIVE, source="alpha",
+        ))
+        beliefs = await loop.backend.all_beliefs()
+        confidence_after_1b = beliefs[0].confidence
+
+        # Agent BETA confirms (independent replication)
+        await loop.assimilate(Observation(
+            capability="mining", description="batch=64 works",
+            valence=Valence.POSITIVE, source="beta",
+        ))
+        beliefs = await loop.backend.all_beliefs()
+        confidence_after_cross = beliefs[0].confidence
+        cross_boost = confidence_after_cross - confidence_after_1b
+
+        assert cross_boost > self_boost
+
+    async def test_cross_agent_bonus_disabled(self, loop):
+        """cross_agent_bonus=1.0 gives same boost regardless of source."""
+        loop.cross_agent_bonus = 1.0
+
+        await loop.assimilate(Observation(
+            capability="mining", description="batch=64 works",
+            valence=Valence.POSITIVE, source="alpha",
+        ))
+        beliefs = await loop.backend.all_beliefs()
+        c1 = beliefs[0].confidence
+
+        await loop.assimilate(Observation(
+            capability="mining", description="batch=64 works",
+            valence=Valence.POSITIVE, source="beta",
+        ))
+        beliefs = await loop.backend.all_beliefs()
+        cross_boost = beliefs[0].confidence - c1
+
+        # Should be same as strengthen_rate (no bonus)
+        assert abs(cross_boost - loop.strengthen_rate) < 0.001
+
+    async def test_no_bonus_when_sources_match(self, loop):
+        """Same-source confirmation gets normal strengthen_rate."""
+        await loop.assimilate(Observation(
+            capability="mining", description="batch=64 works",
+            valence=Valence.POSITIVE, source="alpha",
+        ))
+        beliefs = await loop.backend.all_beliefs()
+        c1 = beliefs[0].confidence
+
+        await loop.assimilate(Observation(
+            capability="mining", description="batch=64 works",
+            valence=Valence.POSITIVE, source="alpha",
+        ))
+        beliefs = await loop.backend.all_beliefs()
+        boost = beliefs[0].confidence - c1
+
+        assert abs(boost - loop.strengthen_rate) < 0.001
+
+    async def test_no_bonus_when_source_is_none(self, loop):
+        """No bonus when either source is None."""
+        await loop.assimilate(Observation(
+            capability="mining", description="batch=64 works",
+            valence=Valence.POSITIVE, source=None,
+        ))
+        beliefs = await loop.backend.all_beliefs()
+        c1 = beliefs[0].confidence
+
+        await loop.assimilate(Observation(
+            capability="mining", description="batch=64 works",
+            valence=Valence.POSITIVE, source="beta",
+        ))
+        beliefs = await loop.backend.all_beliefs()
+        boost = beliefs[0].confidence - c1
+
+        assert abs(boost - loop.strengthen_rate) < 0.001
+
+
+# ======================================================================
+# Exploration pressure
+# ======================================================================
+
+@pytest.mark.asyncio
+class TestExploration:
+    async def test_exploration_can_surface_weak_beliefs(self, tmp_dir):
+        """With exploration, weak beliefs occasionally outrank strong ones."""
+        backend = JsonMemoryBackend(tmp_dir / "memory")
+        loop = MemoryLoop(backend=backend, exploration_rate=2.0)  # high noise
+
+        for _ in range(10):
+            await loop.assimilate(Observation(
+                capability="x", description="dominant",
+                valence=Valence.POSITIVE,
+            ))
+        await loop.assimilate(Observation(
+            capability="x", description="underdog",
+            valence=Valence.POSITIVE,
+        ))
+
+        # With high exploration, the underdog should surface at least once in 20 tries
+        found = False
+        for _ in range(20):
+            ctx = await loop.context_for("x", max_entries=1)
+            if "underdog" in ctx:
+                found = True
+                break
+        assert found
+
+    async def test_exploration_off_by_default(self, loop):
+        """With default exploration_rate=0.0, only strongest beliefs appear."""
+        for _ in range(10):
+            await loop.assimilate(Observation(
+                capability="x", description="dominant",
+                valence=Valence.POSITIVE,
+            ))
+        await loop.assimilate(Observation(
+            capability="x", description="weak",
+            valence=Valence.POSITIVE,
+        ))
+
+        # With exploration off, the weak belief should never appear in max_entries=1
+        for _ in range(10):
+            ctx = await loop.context_for("x", max_entries=1)
+            assert "weak" not in ctx
+
+
+# ======================================================================
+# Strategy bundling via run_id
+# ======================================================================
+
+@pytest.mark.asyncio
+class TestStrategyBundling:
+    async def test_run_id_creates_strategy_bundle(self, loop):
+        """Beliefs from the same run share a tag and can be retrieved together."""
+        await loop.assimilate(Observation(
+            capability="training", description="batch=64",
+            valence=Valence.POSITIVE, run_id="run-042",
+        ))
+        await loop.assimilate(Observation(
+            capability="training", description="cosine lr",
+            valence=Valence.POSITIVE, run_id="run-042",
+        ))
+        await loop.assimilate(Observation(
+            capability="training", description="unrelated approach",
+            valence=Valence.POSITIVE, run_id="run-099",
+        ))
+
+        # Query by run tag retrieves the bundle
+        bundle = await loop.backend.query(tags=("run:run-042",))
+        assert len(bundle) == 2
+        descriptions = {b.description for b in bundle}
+        assert "batch=64" in descriptions
+        assert "cosine lr" in descriptions
+        assert "unrelated approach" not in descriptions
+
+    async def test_no_run_tag_without_run_id(self, loop):
+        """Beliefs without run_id get no run: tag."""
+        await loop.assimilate(Observation(
+            capability="training", description="batch=64",
+            valence=Valence.POSITIVE,
+        ))
+
+        beliefs = await loop.backend.all_beliefs()
+        assert not any(t.startswith("run:") for t in beliefs[0].tags)
+
+    async def test_run_tag_merges_on_agreement(self, loop):
+        """Run tag is added when a new run confirms an existing belief."""
+        await loop.assimilate(Observation(
+            capability="training", description="batch=64",
+            valence=Valence.POSITIVE,
+        ))
+        await loop.assimilate(Observation(
+            capability="training", description="batch=64",
+            valence=Valence.POSITIVE, run_id="run-042",
+        ))
+
+        beliefs = await loop.backend.all_beliefs()
+        assert "run:run-042" in beliefs[0].tags
+
+
+# ======================================================================
+# Crisis detection
+# ======================================================================
+
+@pytest.mark.asyncio
+class TestCrisisDetection:
+    async def test_crisis_mode_accelerates_weakening(self, loop):
+        """Consecutive contradictions make the system more plastic."""
+        loop.crisis_multiplier = 3.0
+
+        # Establish a strong belief
+        for _ in range(5):
+            await loop.assimilate(Observation(
+                capability="x", description="old strategy",
+                valence=Valence.POSITIVE,
+            ))
+
+        beliefs = await loop.backend.all_beliefs()
+        conf_before = beliefs[0].confidence
+
+        # Three consecutive contradictions should trigger crisis mode
+        for i in range(3):
+            await loop.assimilate(Observation(
+                capability="x", description="old strategy",
+                valence=Valence.NEGATIVE,
+            ))
+
+        beliefs = await loop.backend.all_beliefs()
+        old = [b for b in beliefs if "old strategy" in b.description][0]
+        total_drop = conf_before - old.confidence
+
+        # Compare: without crisis, drop would be 3 × 0.3 = 0.9
+        # With crisis (kicks in at contradiction 3): 0.3 + 0.3 + 0.9 = 1.5
+        assert total_drop > 0.9 * 1.3  # at least 30% more than non-crisis
+
+    async def test_agreement_resets_crisis(self, loop):
+        """One agreement resets the contradiction streak."""
+        loop.crisis_multiplier = 3.0
+
+        await loop.assimilate(Observation(
+            capability="x", description="strategy A",
+            valence=Valence.POSITIVE,
+        ))
+
+        # Two contradictions
+        await loop.assimilate(Observation(
+            capability="x", description="strategy A",
+            valence=Valence.NEGATIVE,
+        ))
+        await loop.assimilate(Observation(
+            capability="x", description="strategy A",
+            valence=Valence.NEGATIVE,
+        ))
+        assert loop._contradiction_streak == 2
+
+        # One agreement resets
+        await loop.assimilate(Observation(
+            capability="x", description="strategy A",
+            valence=Valence.POSITIVE,
+        ))
+        assert loop._contradiction_streak == 0
+
+    async def test_crisis_disabled_at_multiplier_one(self, loop):
+        """crisis_multiplier=1.0 means no acceleration."""
+        loop.crisis_multiplier = 1.0
+
+        # Build up high confidence so it survives all contradictions
+        for _ in range(10):
+            await loop.assimilate(Observation(
+                capability="x", description="belief",
+                valence=Valence.POSITIVE,
+            ))
+
+        beliefs = await loop.backend.all_beliefs()
+        conf_before = beliefs[0].confidence
+
+        for _ in range(5):
+            await loop.assimilate(Observation(
+                capability="x", description="belief",
+                valence=Valence.NEGATIVE,
+            ))
+
+        beliefs = await loop.backend.all_beliefs()
+        old = [b for b in beliefs if "belief" in b.description]
+        if old:
+            total_drop = conf_before - old[0].confidence
+            # Should be exactly 5 × 0.3 = 1.5 (no acceleration)
+            assert abs(total_drop - 5 * loop.weaken_rate) < 0.01
+
+    async def test_streak_decays_on_forget(self, loop):
+        """Between-runs decay prevents slow-burn false crises."""
+        loop.crisis_multiplier = 3.0
+
+        await loop.assimilate(Observation(
+            capability="x", description="A",
+            valence=Valence.POSITIVE,
+        ))
+        await loop.assimilate(Observation(
+            capability="x", description="A",
+            valence=Valence.NEGATIVE,
+        ))
+        await loop.assimilate(Observation(
+            capability="x", description="A",
+            valence=Valence.NEGATIVE,
+        ))
+        assert loop._contradiction_streak == 2
+
+        await loop.forget()
+        assert loop._contradiction_streak == 1
+
+        await loop.forget()
+        assert loop._contradiction_streak == 0

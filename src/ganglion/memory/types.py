@@ -101,11 +101,20 @@ class Belief:
     def strength(self) -> float:
         """Composite score: confirmation × recency × confidence.
 
-        Used for ranking (best beliefs surface first in prompts)
-        and eviction (weakest beliefs get forgotten first).
+        Beliefs confirmed more than `consolidation_threshold` times are
+        considered consolidated into long-term memory and receive a
+        recency floor, preventing eviction of well-established knowledge.
         """
         recency_hours = (datetime.now(UTC) - self.last_confirmed).total_seconds() / 3600
         recency_factor = 1.0 / (1.0 + recency_hours / 168.0)
+
+        # Long-term memory consolidation: highly confirmed beliefs
+        # get a recency floor so they don't decay away
+        consolidation_threshold = 5
+        if self.confirmation_count >= consolidation_threshold:
+            recency_floor = 0.5
+            recency_factor = max(recency_factor, recency_floor)
+
         return self.confidence * self.confirmation_count * recency_factor
 
     def to_dict(self) -> dict[str, Any]:

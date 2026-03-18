@@ -5,7 +5,9 @@ from ganglion.memory.backends.base import MemoryBackend
 from ganglion.memory.backends.federated import FederatedMemoryBackend, PeerDiscovery
 from ganglion.memory.backends.json_file import JsonMemoryBackend
 from ganglion.memory.backends.sqlite import SqliteMemoryBackend
+from ganglion.memory.cortex import spread_activation, temporal_neighbors
 from ganglion.memory.loop import MemoryLoop
+from ganglion.memory.similarity import jaccard_similarity, tokenize
 from ganglion.memory.types import Belief, Delta, Observation, Valence
 
 __all__ = [
@@ -15,6 +17,12 @@ __all__ = [
     "Belief",
     "Delta",
     "Valence",
+    # Similarity
+    "jaccard_similarity",
+    "tokenize",
+    # Cortex — advanced retrieval
+    "spread_activation",
+    "temporal_neighbors",
     # Agent integration
     "MemoryAgent",
     "between_runs",
