@@ -9,6 +9,7 @@ from ganglion.memory.cortex import spread_activation, temporal_neighbors
 from ganglion.memory.loop import MemoryLoop
 from ganglion.memory.similarity import jaccard_similarity, tokenize
 from ganglion.memory.types import Belief, Delta, Observation, Valence
+from ganglion.memory.wrap import memory
 
 __all__ = [
     # Core
@@ -33,4 +34,6 @@ __all__ = [
     "JsonMemoryBackend",
     "FederatedMemoryBackend",
     "PeerDiscovery",
+    # One-line wrapper
+    "memory",
 ]
