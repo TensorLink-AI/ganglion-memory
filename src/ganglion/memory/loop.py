@@ -64,11 +64,15 @@ class MemoryLoop:
     # Exploration pressure in context_for()
     exploration_rate: float = 0.0
 
+    # Crisis detection: accelerate weakening on consecutive contradictions
+    crisis_multiplier: float = 3.0
+
     # Consolidation Jaccard threshold for forget()
     consolidation_threshold: float = 0.5
 
     _pending_deltas: list[Delta] = field(default_factory=list)
     _delta_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    _contradiction_streak: int = 0
 
     # ------------------------------------------------------------------
     # Write path: the single primitive
@@ -108,6 +112,7 @@ class MemoryLoop:
 
         # Agreement: same valence
         if obs.valence == existing.valence:
+            self._contradiction_streak = 0
             delta = self._check_metric_shift(existing, obs)
 
             if delta is None:
@@ -157,7 +162,14 @@ class MemoryLoop:
             new_observation=obs,
             delta_type="contradiction",
         )
-        existing.confidence -= self.weaken_rate
+        self._contradiction_streak += 1
+
+        # Crisis mode: consecutive contradictions increase plasticity
+        effective_weaken = self.weaken_rate
+        if self._contradiction_streak >= 3 and self.crisis_multiplier > 1.0:
+            effective_weaken *= self.crisis_multiplier
+
+        existing.confidence -= effective_weaken
 
         if existing.confidence <= self.death_threshold:
             existing.superseded_by = obs.description
@@ -376,6 +388,9 @@ class MemoryLoop:
         if consolidated > 0:
             # Re-read after consolidation changed the store
             all_beliefs = await self.backend.all_beliefs()
+
+        # Decay contradiction streak between runs (crisis is transient)
+        self._contradiction_streak = max(0, self._contradiction_streak - 1)
 
         # Phase 2: eviction — remove weakest
         if len(all_beliefs) <= self.max_beliefs:

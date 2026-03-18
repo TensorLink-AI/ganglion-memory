@@ -1432,3 +1432,117 @@ class TestStrategyBundling:
 
         beliefs = await loop.backend.all_beliefs()
         assert "run:run-042" in beliefs[0].tags
+
+
+# ======================================================================
+# Crisis detection
+# ======================================================================
+
+@pytest.mark.asyncio
+class TestCrisisDetection:
+    async def test_crisis_mode_accelerates_weakening(self, loop):
+        """Consecutive contradictions make the system more plastic."""
+        loop.crisis_multiplier = 3.0
+
+        # Establish a strong belief
+        for _ in range(5):
+            await loop.assimilate(Observation(
+                capability="x", description="old strategy",
+                valence=Valence.POSITIVE,
+            ))
+
+        beliefs = await loop.backend.all_beliefs()
+        conf_before = beliefs[0].confidence
+
+        # Three consecutive contradictions should trigger crisis mode
+        for i in range(3):
+            await loop.assimilate(Observation(
+                capability="x", description="old strategy",
+                valence=Valence.NEGATIVE,
+            ))
+
+        beliefs = await loop.backend.all_beliefs()
+        old = [b for b in beliefs if "old strategy" in b.description][0]
+        total_drop = conf_before - old.confidence
+
+        # Compare: without crisis, drop would be 3 × 0.3 = 0.9
+        # With crisis (kicks in at contradiction 3): 0.3 + 0.3 + 0.9 = 1.5
+        assert total_drop > 0.9 * 1.3  # at least 30% more than non-crisis
+
+    async def test_agreement_resets_crisis(self, loop):
+        """One agreement resets the contradiction streak."""
+        loop.crisis_multiplier = 3.0
+
+        await loop.assimilate(Observation(
+            capability="x", description="strategy A",
+            valence=Valence.POSITIVE,
+        ))
+
+        # Two contradictions
+        await loop.assimilate(Observation(
+            capability="x", description="strategy A",
+            valence=Valence.NEGATIVE,
+        ))
+        await loop.assimilate(Observation(
+            capability="x", description="strategy A",
+            valence=Valence.NEGATIVE,
+        ))
+        assert loop._contradiction_streak == 2
+
+        # One agreement resets
+        await loop.assimilate(Observation(
+            capability="x", description="strategy A",
+            valence=Valence.POSITIVE,
+        ))
+        assert loop._contradiction_streak == 0
+
+    async def test_crisis_disabled_at_multiplier_one(self, loop):
+        """crisis_multiplier=1.0 means no acceleration."""
+        loop.crisis_multiplier = 1.0
+
+        # Build up high confidence so it survives all contradictions
+        for _ in range(10):
+            await loop.assimilate(Observation(
+                capability="x", description="belief",
+                valence=Valence.POSITIVE,
+            ))
+
+        beliefs = await loop.backend.all_beliefs()
+        conf_before = beliefs[0].confidence
+
+        for _ in range(5):
+            await loop.assimilate(Observation(
+                capability="x", description="belief",
+                valence=Valence.NEGATIVE,
+            ))
+
+        beliefs = await loop.backend.all_beliefs()
+        old = [b for b in beliefs if "belief" in b.description]
+        if old:
+            total_drop = conf_before - old[0].confidence
+            # Should be exactly 5 × 0.3 = 1.5 (no acceleration)
+            assert abs(total_drop - 5 * loop.weaken_rate) < 0.01
+
+    async def test_streak_decays_on_forget(self, loop):
+        """Between-runs decay prevents slow-burn false crises."""
+        loop.crisis_multiplier = 3.0
+
+        await loop.assimilate(Observation(
+            capability="x", description="A",
+            valence=Valence.POSITIVE,
+        ))
+        await loop.assimilate(Observation(
+            capability="x", description="A",
+            valence=Valence.NEGATIVE,
+        ))
+        await loop.assimilate(Observation(
+            capability="x", description="A",
+            valence=Valence.NEGATIVE,
+        ))
+        assert loop._contradiction_streak == 2
+
+        await loop.forget()
+        assert loop._contradiction_streak == 1
+
+        await loop.forget()
+        assert loop._contradiction_streak == 0
