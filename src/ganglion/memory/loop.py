@@ -18,6 +18,7 @@ import asyncio
 import copy
 import logging
 import math
+import random
 from dataclasses import dataclass, field
 
 from ganglion.memory.backends.base import MemoryBackend
@@ -57,6 +58,12 @@ class MemoryLoop:
     inhibition_rate: float = 0.05
     inhibition_floor: float = 0.2
 
+    # Cross-agent confirmation weighting
+    cross_agent_bonus: float = 2.0
+
+    # Exploration pressure in context_for()
+    exploration_rate: float = 0.0
+
     # Consolidation Jaccard threshold for forget()
     consolidation_threshold: float = 0.5
 
@@ -75,6 +82,10 @@ class MemoryLoop:
         """
         existing = await self.backend.find_similar(obs)
 
+        # Strategy bundling: include run tag when run_id is present
+        run_tags = (f"run:{obs.run_id}",) if obs.run_id else ()
+        obs_tags = obs.tags + run_tags
+
         if existing is None:
             # Novel observation — compute salience for initial confidence
             confidence = await self._compute_salience(obs) if self.salience else 1.0
@@ -89,7 +100,7 @@ class MemoryLoop:
                 metric_name=obs.metric_name,
                 metric_value=obs.metric_value,
                 source=obs.source,
-                tags=obs.tags,
+                tags=obs_tags,
                 first_seen=obs.timestamp,
                 last_confirmed=obs.timestamp,
             ))
@@ -101,7 +112,17 @@ class MemoryLoop:
 
             if delta is None:
                 # Pure agreement — strengthen
-                existing.confidence = min(10.0, existing.confidence + self.strengthen_rate)
+                # Cross-agent confirmation is worth more than self-confirmation
+                rate = self.strengthen_rate
+                if (
+                    self.cross_agent_bonus > 1.0
+                    and obs.source
+                    and existing.source
+                    and obs.source != existing.source
+                ):
+                    rate *= self.cross_agent_bonus
+
+                existing.confidence = min(10.0, existing.confidence + rate)
                 existing.confirmation_count += 1
             else:
                 # Metric shifted significantly — don't strengthen
@@ -118,7 +139,7 @@ class MemoryLoop:
                 existing.last_metric_value = existing.metric_value
                 existing.metric_value = obs.metric_value
             existing.entities = _stable_merge(existing.entities, obs.entities)
-            existing.tags = _stable_merge(existing.tags, obs.tags)
+            existing.tags = _stable_merge(existing.tags, obs_tags)
             await self.backend.update(existing)
 
             # Lateral inhibition — weaken competitors on agreement
@@ -152,7 +173,7 @@ class MemoryLoop:
                 metric_name=obs.metric_name,
                 metric_value=obs.metric_value,
                 source=obs.source,
-                tags=obs.tags,
+                tags=obs_tags,
                 first_seen=obs.timestamp,
                 last_confirmed=obs.timestamp,
             ))
@@ -272,13 +293,23 @@ class MemoryLoop:
             entities=entities,
             exclude_source=exclude_source,
             tags=tags,
-            limit=max_entries * 2,
+            limit=max_entries * 3 if self.exploration_rate > 0 else max_entries * 2,
         )
 
         if not beliefs:
             return ""
 
         beliefs.sort(key=lambda b: b.strength, reverse=True)
+
+        # Exploration: occasionally promote a lower-ranked belief
+        if (
+            self.exploration_rate > 0
+            and len(beliefs) > max_entries
+            and random.random() < self.exploration_rate
+        ):
+            promoted = random.choice(beliefs[max_entries:])
+            beliefs[max_entries - 1] = promoted
+
         beliefs = beliefs[:max_entries]
 
         patterns = [b for b in beliefs if b.is_pattern]

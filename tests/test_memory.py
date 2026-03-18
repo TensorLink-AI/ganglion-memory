@@ -1224,3 +1224,213 @@ class TestConsolidation:
             merged = remaining[0]
             assert list(merged.entities) == sorted(merged.entities)
             assert list(merged.tags) == sorted(merged.tags)
+
+
+# ======================================================================
+# Cross-agent confirmation weighting
+# ======================================================================
+
+@pytest.mark.asyncio
+class TestCrossAgentBonus:
+    async def test_cross_agent_confirmation_bonus(self, loop):
+        """Different-source confirmation strengthens more than same-source."""
+        # Agent alpha discovers something
+        await loop.assimilate(Observation(
+            capability="mining", description="batch=64 works",
+            valence=Valence.POSITIVE, source="alpha",
+        ))
+        beliefs = await loop.backend.all_beliefs()
+        confidence_after_1 = beliefs[0].confidence
+
+        # Alpha confirms its own finding
+        await loop.assimilate(Observation(
+            capability="mining", description="batch=64 works",
+            valence=Valence.POSITIVE, source="alpha",
+        ))
+        beliefs = await loop.backend.all_beliefs()
+        confidence_after_self = beliefs[0].confidence
+        self_boost = confidence_after_self - confidence_after_1
+
+        # Reset — start fresh
+        for b in await loop.backend.all_beliefs():
+            await loop.backend.remove(b)
+
+        # Agent alpha discovers again
+        await loop.assimilate(Observation(
+            capability="mining", description="batch=64 works",
+            valence=Valence.POSITIVE, source="alpha",
+        ))
+        beliefs = await loop.backend.all_beliefs()
+        confidence_after_1b = beliefs[0].confidence
+
+        # Agent BETA confirms (independent replication)
+        await loop.assimilate(Observation(
+            capability="mining", description="batch=64 works",
+            valence=Valence.POSITIVE, source="beta",
+        ))
+        beliefs = await loop.backend.all_beliefs()
+        confidence_after_cross = beliefs[0].confidence
+        cross_boost = confidence_after_cross - confidence_after_1b
+
+        assert cross_boost > self_boost
+
+    async def test_cross_agent_bonus_disabled(self, loop):
+        """cross_agent_bonus=1.0 gives same boost regardless of source."""
+        loop.cross_agent_bonus = 1.0
+
+        await loop.assimilate(Observation(
+            capability="mining", description="batch=64 works",
+            valence=Valence.POSITIVE, source="alpha",
+        ))
+        beliefs = await loop.backend.all_beliefs()
+        c1 = beliefs[0].confidence
+
+        await loop.assimilate(Observation(
+            capability="mining", description="batch=64 works",
+            valence=Valence.POSITIVE, source="beta",
+        ))
+        beliefs = await loop.backend.all_beliefs()
+        cross_boost = beliefs[0].confidence - c1
+
+        # Should be same as strengthen_rate (no bonus)
+        assert abs(cross_boost - loop.strengthen_rate) < 0.001
+
+    async def test_no_bonus_when_sources_match(self, loop):
+        """Same-source confirmation gets normal strengthen_rate."""
+        await loop.assimilate(Observation(
+            capability="mining", description="batch=64 works",
+            valence=Valence.POSITIVE, source="alpha",
+        ))
+        beliefs = await loop.backend.all_beliefs()
+        c1 = beliefs[0].confidence
+
+        await loop.assimilate(Observation(
+            capability="mining", description="batch=64 works",
+            valence=Valence.POSITIVE, source="alpha",
+        ))
+        beliefs = await loop.backend.all_beliefs()
+        boost = beliefs[0].confidence - c1
+
+        assert abs(boost - loop.strengthen_rate) < 0.001
+
+    async def test_no_bonus_when_source_is_none(self, loop):
+        """No bonus when either source is None."""
+        await loop.assimilate(Observation(
+            capability="mining", description="batch=64 works",
+            valence=Valence.POSITIVE, source=None,
+        ))
+        beliefs = await loop.backend.all_beliefs()
+        c1 = beliefs[0].confidence
+
+        await loop.assimilate(Observation(
+            capability="mining", description="batch=64 works",
+            valence=Valence.POSITIVE, source="beta",
+        ))
+        beliefs = await loop.backend.all_beliefs()
+        boost = beliefs[0].confidence - c1
+
+        assert abs(boost - loop.strengthen_rate) < 0.001
+
+
+# ======================================================================
+# Exploration pressure
+# ======================================================================
+
+@pytest.mark.asyncio
+class TestExploration:
+    async def test_exploration_promotes_weak_beliefs(self, tmp_dir):
+        """With exploration_rate > 0, weak beliefs occasionally appear in context."""
+        backend = JsonMemoryBackend(tmp_dir / "memory")
+        loop = MemoryLoop(backend=backend, exploration_rate=1.0)  # always explore
+
+        # Create a dominant belief (confirmed 10x)
+        for _ in range(10):
+            await loop.assimilate(Observation(
+                capability="x", description="dominant strategy",
+                valence=Valence.POSITIVE,
+            ))
+        # Create a weak belief (confirmed 1x)
+        await loop.assimilate(Observation(
+            capability="x", description="underdog strategy",
+            valence=Valence.POSITIVE,
+        ))
+
+        # With exploration_rate=1.0, the underdog should appear in context
+        found_underdog = False
+        for _ in range(5):
+            ctx = await loop.context_for("x", max_entries=1)
+            if "underdog" in ctx:
+                found_underdog = True
+                break
+        assert found_underdog
+
+    async def test_exploration_off_by_default(self, loop):
+        """With default exploration_rate=0.0, only strongest beliefs appear."""
+        for _ in range(10):
+            await loop.assimilate(Observation(
+                capability="x", description="dominant",
+                valence=Valence.POSITIVE,
+            ))
+        await loop.assimilate(Observation(
+            capability="x", description="weak",
+            valence=Valence.POSITIVE,
+        ))
+
+        # With exploration off, the weak belief should never appear in max_entries=1
+        for _ in range(10):
+            ctx = await loop.context_for("x", max_entries=1)
+            assert "weak" not in ctx
+
+
+# ======================================================================
+# Strategy bundling via run_id
+# ======================================================================
+
+@pytest.mark.asyncio
+class TestStrategyBundling:
+    async def test_run_id_creates_strategy_bundle(self, loop):
+        """Beliefs from the same run share a tag and can be retrieved together."""
+        await loop.assimilate(Observation(
+            capability="training", description="batch=64",
+            valence=Valence.POSITIVE, run_id="run-042",
+        ))
+        await loop.assimilate(Observation(
+            capability="training", description="cosine lr",
+            valence=Valence.POSITIVE, run_id="run-042",
+        ))
+        await loop.assimilate(Observation(
+            capability="training", description="unrelated approach",
+            valence=Valence.POSITIVE, run_id="run-099",
+        ))
+
+        # Query by run tag retrieves the bundle
+        bundle = await loop.backend.query(tags=("run:run-042",))
+        assert len(bundle) == 2
+        descriptions = {b.description for b in bundle}
+        assert "batch=64" in descriptions
+        assert "cosine lr" in descriptions
+        assert "unrelated approach" not in descriptions
+
+    async def test_no_run_tag_without_run_id(self, loop):
+        """Beliefs without run_id get no run: tag."""
+        await loop.assimilate(Observation(
+            capability="training", description="batch=64",
+            valence=Valence.POSITIVE,
+        ))
+
+        beliefs = await loop.backend.all_beliefs()
+        assert not any(t.startswith("run:") for t in beliefs[0].tags)
+
+    async def test_run_tag_merges_on_agreement(self, loop):
+        """Run tag is added when a new run confirms an existing belief."""
+        await loop.assimilate(Observation(
+            capability="training", description="batch=64",
+            valence=Valence.POSITIVE,
+        ))
+        await loop.assimilate(Observation(
+            capability="training", description="batch=64",
+            valence=Valence.POSITIVE, run_id="run-042",
+        ))
+
+        beliefs = await loop.backend.all_beliefs()
+        assert "run:run-042" in beliefs[0].tags
