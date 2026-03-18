@@ -293,22 +293,19 @@ class MemoryLoop:
             entities=entities,
             exclude_source=exclude_source,
             tags=tags,
-            limit=max_entries * 3 if self.exploration_rate > 0 else max_entries * 2,
+            limit=max_entries * 2,
         )
 
         if not beliefs:
             return ""
 
-        beliefs.sort(key=lambda b: b.strength, reverse=True)
-
-        # Exploration: occasionally promote a lower-ranked belief
-        if (
-            self.exploration_rate > 0
-            and len(beliefs) > max_entries
-            and random.random() < self.exploration_rate
-        ):
-            promoted = random.choice(beliefs[max_entries:])
-            beliefs[max_entries - 1] = promoted
+        if self.exploration_rate > 0:
+            beliefs.sort(
+                key=lambda b: b.strength + random.gauss(0, self.exploration_rate * b.strength),
+                reverse=True,
+            )
+        else:
+            beliefs.sort(key=lambda b: b.strength, reverse=True)
 
         beliefs = beliefs[:max_entries]
 

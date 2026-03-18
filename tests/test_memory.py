@@ -1338,31 +1338,29 @@ class TestCrossAgentBonus:
 
 @pytest.mark.asyncio
 class TestExploration:
-    async def test_exploration_promotes_weak_beliefs(self, tmp_dir):
-        """With exploration_rate > 0, weak beliefs occasionally appear in context."""
+    async def test_exploration_can_surface_weak_beliefs(self, tmp_dir):
+        """With exploration, weak beliefs occasionally outrank strong ones."""
         backend = JsonMemoryBackend(tmp_dir / "memory")
-        loop = MemoryLoop(backend=backend, exploration_rate=1.0)  # always explore
+        loop = MemoryLoop(backend=backend, exploration_rate=2.0)  # high noise
 
-        # Create a dominant belief (confirmed 10x)
         for _ in range(10):
             await loop.assimilate(Observation(
-                capability="x", description="dominant strategy",
+                capability="x", description="dominant",
                 valence=Valence.POSITIVE,
             ))
-        # Create a weak belief (confirmed 1x)
         await loop.assimilate(Observation(
-            capability="x", description="underdog strategy",
+            capability="x", description="underdog",
             valence=Valence.POSITIVE,
         ))
 
-        # With exploration_rate=1.0, the underdog should appear in context
-        found_underdog = False
-        for _ in range(5):
+        # With high exploration, the underdog should surface at least once in 20 tries
+        found = False
+        for _ in range(20):
             ctx = await loop.context_for("x", max_entries=1)
             if "underdog" in ctx:
-                found_underdog = True
+                found = True
                 break
-        assert found_underdog
+        assert found
 
     async def test_exploration_off_by_default(self, loop):
         """With default exploration_rate=0.0, only strongest beliefs appear."""
