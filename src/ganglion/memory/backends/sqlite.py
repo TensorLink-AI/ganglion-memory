@@ -7,6 +7,7 @@ column distinguishes positive/negative/neutral.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import sqlite3
@@ -51,109 +52,144 @@ class SqliteMemoryBackend:
     def __init__(self, db_path: str | Path):
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._conn = sqlite3.connect(
+            str(self.db_path), check_same_thread=False, isolation_level=None,
+        )
+        self._conn.row_factory = sqlite3.Row
+        self._conn.execute("PRAGMA journal_mode=WAL")
         self._init_db()
 
     def _init_db(self) -> None:
-        with self._connect() as conn:
-            conn.executescript(_SCHEMA)
+        self._conn.executescript(_SCHEMA)
+        self._conn.commit()
 
-    def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(str(self.db_path))
-        conn.row_factory = sqlite3.Row
-        return conn
+    def close(self) -> None:
+        self._conn.close()
+
+    def __del__(self) -> None:
+        try:
+            self._conn.close()
+        except Exception:
+            pass
 
     # -- Write operations --------------------------------------------------
 
-    async def store(self, belief: Belief) -> None:
-        with self._connect() as conn:
-            cursor = conn.execute(
-                """INSERT INTO beliefs
-                   (capability, description, valence, confidence, confirmation_count,
-                    entities, config, metric_name, metric_value, last_metric_value,
-                    source, first_seen, last_confirmed, last_retrieved,
-                    superseded_by, tags)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (
-                    belief.capability,
-                    belief.description,
-                    belief.valence.value,
-                    belief.confidence,
-                    belief.confirmation_count,
-                    json.dumps(list(belief.entities)),
-                    json.dumps(belief.config) if belief.config else None,
-                    belief.metric_name,
-                    belief.metric_value,
-                    belief.last_metric_value,
-                    belief.source,
-                    belief.first_seen.isoformat(),
-                    belief.last_confirmed.isoformat(),
-                    belief.last_retrieved.isoformat() if belief.last_retrieved else None,
-                    belief.superseded_by,
-                    json.dumps(list(belief.tags)),
-                ),
-            )
-            belief.id = cursor.lastrowid
+    def _store_sync(self, belief: Belief) -> int:
+        cursor = self._conn.execute(
+            """INSERT INTO beliefs
+               (capability, description, valence, confidence, confirmation_count,
+                entities, config, metric_name, metric_value, last_metric_value,
+                source, first_seen, last_confirmed, last_retrieved,
+                superseded_by, tags)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                belief.capability,
+                belief.description,
+                belief.valence.value,
+                belief.confidence,
+                belief.confirmation_count,
+                json.dumps(list(belief.entities)),
+                json.dumps(belief.config) if belief.config else None,
+                belief.metric_name,
+                belief.metric_value,
+                belief.last_metric_value,
+                belief.source,
+                belief.first_seen.isoformat(),
+                belief.last_confirmed.isoformat(),
+                belief.last_retrieved.isoformat() if belief.last_retrieved else None,
+                belief.superseded_by,
+                json.dumps(list(belief.tags)),
+            ),
+        )
+        self._conn.commit()
+        return cursor.lastrowid
 
-    async def update(self, belief: Belief) -> None:
+    async def store(self, belief: Belief) -> None:
+        belief.id = await asyncio.to_thread(self._store_sync, belief)
+
+    def _update_sync(self, belief: Belief) -> None:
         if belief.id is None:
             raise ValueError("Cannot update a belief without an id")
-        with self._connect() as conn:
-            conn.execute(
-                """UPDATE beliefs SET
-                    capability=?, description=?, valence=?, confidence=?,
-                    confirmation_count=?, entities=?, config=?,
-                    metric_name=?, metric_value=?, last_metric_value=?,
-                    source=?, first_seen=?, last_confirmed=?, last_retrieved=?,
-                    superseded_by=?, tags=?
-                   WHERE id=?""",
-                (
-                    belief.capability,
-                    belief.description,
-                    belief.valence.value,
-                    belief.confidence,
-                    belief.confirmation_count,
-                    json.dumps(list(belief.entities)),
-                    json.dumps(belief.config) if belief.config else None,
-                    belief.metric_name,
-                    belief.metric_value,
-                    belief.last_metric_value,
-                    belief.source,
-                    belief.first_seen.isoformat(),
-                    belief.last_confirmed.isoformat(),
-                    belief.last_retrieved.isoformat() if belief.last_retrieved else None,
-                    belief.superseded_by,
-                    json.dumps(list(belief.tags)),
-                    belief.id,
-                ),
-            )
+        self._conn.execute(
+            """UPDATE beliefs SET
+                capability=?, description=?, valence=?, confidence=?,
+                confirmation_count=?, entities=?, config=?,
+                metric_name=?, metric_value=?, last_metric_value=?,
+                source=?, first_seen=?, last_confirmed=?, last_retrieved=?,
+                superseded_by=?, tags=?
+               WHERE id=?""",
+            (
+                belief.capability,
+                belief.description,
+                belief.valence.value,
+                belief.confidence,
+                belief.confirmation_count,
+                json.dumps(list(belief.entities)),
+                json.dumps(belief.config) if belief.config else None,
+                belief.metric_name,
+                belief.metric_value,
+                belief.last_metric_value,
+                belief.source,
+                belief.first_seen.isoformat(),
+                belief.last_confirmed.isoformat(),
+                belief.last_retrieved.isoformat() if belief.last_retrieved else None,
+                belief.superseded_by,
+                json.dumps(list(belief.tags)),
+                belief.id,
+            ),
+        )
+        self._conn.commit()
 
-    async def remove(self, belief: Belief) -> None:
+    async def update(self, belief: Belief) -> None:
+        await asyncio.to_thread(self._update_sync, belief)
+
+    def _remove_sync(self, belief: Belief) -> None:
         if belief.id is None:
             return
-        with self._connect() as conn:
-            conn.execute("DELETE FROM beliefs WHERE id=?", (belief.id,))
+        self._conn.execute("DELETE FROM beliefs WHERE id=?", (belief.id,))
+        self._conn.commit()
+
+    async def remove(self, belief: Belief) -> None:
+        await asyncio.to_thread(self._remove_sync, belief)
 
     # -- Read operations ---------------------------------------------------
+
+    def _find_similar_sync(
+        self,
+        observation: Observation,
+        threshold: float = 0.85,
+    ) -> Belief | None:
+        """Find the belief most similar to this observation.
+
+        First checks for exact capability match, then ranks by
+        token-level Jaccard similarity on description.
+        """
+        from ganglion.memory.similarity import jaccard_similarity
+
+        rows = self._conn.execute(
+            "SELECT * FROM beliefs WHERE capability = ? AND superseded_by IS NULL",
+            (observation.capability,),
+        ).fetchall()
+
+        best_match: Belief | None = None
+        best_score = 0.0
+
+        for row in rows:
+            score = jaccard_similarity(observation.description, row["description"])
+            if score >= threshold and score > best_score:
+                best_score = score
+                best_match = self._row_to_belief(row)
+
+        return best_match
 
     async def find_similar(
         self,
         observation: Observation,
         threshold: float = 0.85,
     ) -> Belief | None:
-        """Find a belief matching this observation.
+        return await asyncio.to_thread(self._find_similar_sync, observation, threshold)
 
-        Default: exact match on (capability, description[:200]).
-        For fuzzy/embedding similarity, subclass and override this.
-        """
-        desc_prefix = observation.description[:200]
-        with self._connect() as conn:
-            row = conn.execute(
-                "SELECT * FROM beliefs WHERE capability=? AND description LIKE ? LIMIT 1",
-                (observation.capability, f"{desc_prefix}%"),
-            ).fetchone()
-        return self._row_to_belief(row) if row else None
-
-    async def query(
+    def _query_sync(
         self,
         capability: str | None = None,
         valence: Valence | None = None,
@@ -175,40 +211,52 @@ class SqliteMemoryBackend:
         if exclude_source:
             conditions.append("(source IS NULL OR source != ?)")
             params.append(exclude_source)
-        # Entity filtering: check if any requested entity appears in the JSON array
         for entity in entities:
             conditions.append("entities LIKE ?")
             params.append(f'%"{entity}"%')
-        # Tag filtering
         for tag in tags:
             conditions.append("tags LIKE ?")
             params.append(f'%"{tag}"%')
 
         where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
         sql = f"SELECT * FROM beliefs {where} ORDER BY last_confirmed DESC LIMIT ?"
-        params.append(limit * 2)  # over-fetch for strength filtering
+        params.append(limit * 2)
 
-        with self._connect() as conn:
-            rows = conn.execute(sql, params).fetchall()
-
+        rows = self._conn.execute(sql, params).fetchall()
         beliefs = [self._row_to_belief(row) for row in rows]
 
-        # Filter by strength in Python (can't compute in SQL without the formula)
         if min_strength > 0:
             beliefs = [b for b in beliefs if b.strength >= min_strength]
 
         return beliefs[:limit]
 
-    async def all_beliefs(self) -> list[Belief]:
-        with self._connect() as conn:
-            rows = conn.execute("SELECT * FROM beliefs").fetchall()
+    async def query(
+        self,
+        capability: str | None = None,
+        valence: Valence | None = None,
+        entities: tuple[str, ...] = (),
+        exclude_source: str | None = None,
+        tags: tuple[str, ...] = (),
+        min_strength: float = 0.0,
+        limit: int = 20,
+    ) -> list[Belief]:
+        return await asyncio.to_thread(
+            self._query_sync, capability, valence, entities,
+            exclude_source, tags, min_strength, limit,
+        )
+
+    def _all_beliefs_sync(self) -> list[Belief]:
+        rows = self._conn.execute("SELECT * FROM beliefs").fetchall()
         return [self._row_to_belief(row) for row in rows]
+
+    async def all_beliefs(self) -> list[Belief]:
+        return await asyncio.to_thread(self._all_beliefs_sync)
 
     # -- Row mapping -------------------------------------------------------
 
     @staticmethod
     def _row_to_belief(row: sqlite3.Row) -> Belief:
-        from datetime import datetime
+        from datetime import UTC, datetime
 
         def _parse_dt(val: Any) -> datetime:
             if isinstance(val, str):

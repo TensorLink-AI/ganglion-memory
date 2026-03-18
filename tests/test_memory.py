@@ -10,6 +10,7 @@ agent integration, federation, and the biological properties we care about:
     - Cross-bot knowledge sharing
 """
 
+import asyncio
 import tempfile
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -21,6 +22,7 @@ from ganglion.memory.backends.federated import FederatedMemoryBackend, PeerDisco
 from ganglion.memory.backends.json_file import JsonMemoryBackend
 from ganglion.memory.backends.sqlite import SqliteMemoryBackend
 from ganglion.memory.loop import MemoryLoop
+from ganglion.memory.similarity import jaccard_similarity, tokenize
 from ganglion.memory.types import Belief, Delta, Observation, Valence
 
 
@@ -37,15 +39,20 @@ def json_backend(tmp_dir):
 
 @pytest.fixture
 def sqlite_backend(tmp_dir):
-    return SqliteMemoryBackend(tmp_dir / "memory.db")
+    backend = SqliteMemoryBackend(tmp_dir / "memory.db")
+    yield backend
+    backend.close()
 
 
 @pytest.fixture(params=["json", "sqlite"])
 def backend(request, tmp_dir):
     """Run every backend test against both JSON and SQLite."""
     if request.param == "json":
-        return JsonMemoryBackend(tmp_dir / "memory")
-    return SqliteMemoryBackend(tmp_dir / "memory.db")
+        yield JsonMemoryBackend(tmp_dir / "memory")
+    else:
+        b = SqliteMemoryBackend(tmp_dir / "memory.db")
+        yield b
+        b.close()
 
 
 @pytest.fixture
@@ -138,6 +145,60 @@ class TestTypes:
             delta_type="contradiction",
         )
         assert "contradicted" in d.summary
+
+    def test_long_term_memory_consolidation(self):
+        """Consolidated beliefs (high confirmation_count) resist recency decay."""
+        old_consolidated = Belief(
+            capability="x", description="consolidated",
+            valence=Valence.POSITIVE,
+            confidence=5.0, confirmation_count=10,
+            last_confirmed=datetime.now(UTC) - timedelta(days=60),
+        )
+        new_weak = Belief(
+            capability="x", description="new",
+            valence=Valence.POSITIVE,
+            confidence=1.0, confirmation_count=1,
+            last_confirmed=datetime.now(UTC),
+        )
+        # With consolidation floor (0.5), old belief strength = 5.0 * 10 * 0.5 = 25.0
+        # New belief strength = 1.0 * 1 * ~1.0 = ~1.0
+        assert old_consolidated.strength > new_weak.strength
+        # Verify the floor is in effect (without floor, recency ~0.10 for 60 days)
+        assert old_consolidated.strength >= 5.0 * 10 * 0.5
+
+
+# ======================================================================
+# Similarity
+# ======================================================================
+
+class TestSimilarity:
+    def test_identical_strings(self):
+        assert jaccard_similarity("batch_size=64 works", "batch_size=64 works") == 1.0
+
+    def test_similar_strings(self):
+        score = jaccard_similarity(
+            "batch_size=64 works well for training",
+            "batch 64 works well for training runs"
+        )
+        assert score > 0.7
+
+    def test_dissimilar_strings(self):
+        score = jaccard_similarity(
+            "batch_size=64 works",
+            "learning_rate=0.001 is optimal"
+        )
+        assert score < 0.3
+
+    def test_empty_string(self):
+        assert jaccard_similarity("", "anything") == 0.0
+
+    def test_tokenize(self):
+        tokens = tokenize("batch_size=64 Works WELL")
+        assert "batch" in tokens
+        assert "size" in tokens
+        assert "64" in tokens
+        assert "works" in tokens
+        assert "well" in tokens
 
 
 # ======================================================================
@@ -245,6 +306,76 @@ class TestBackend:
         results = await backend.query(tags=("agent_design",))
         assert len(results) == 1
         assert results[0].description == "A"
+
+    async def test_sqlite_roundtrip_all_beliefs(self, sqlite_backend):
+        """SQLite store + all_beliefs roundtrip (covers _row_to_belief UTC fix)."""
+        belief = Belief(
+            capability="mining", description="test roundtrip",
+            valence=Valence.POSITIVE, confidence=2.0,
+            confirmation_count=3, entities=("sn18",),
+            metric_value=0.9, metric_name="score",
+            source="alpha", tags=("tag1",),
+        )
+        await sqlite_backend.store(belief)
+        beliefs = await sqlite_backend.all_beliefs()
+        assert len(beliefs) == 1
+        b = beliefs[0]
+        assert b.description == "test roundtrip"
+        assert b.confidence == 2.0
+        assert b.confirmation_count == 3
+        assert b.first_seen is not None
+        assert b.last_confirmed is not None
+
+    async def test_find_similar_fuzzy_match(self, backend):
+        """Token-based similarity matches rephrased descriptions."""
+        await backend.store(Belief(
+            capability="train",
+            description="batch_size=64 works well for training",
+            valence=Valence.POSITIVE,
+        ))
+
+        obs = Observation(
+            capability="train",
+            description="batch 64 works well for training runs",
+            valence=Valence.POSITIVE,
+        )
+        # Jaccard score ~0.75, so use a lower threshold
+        found = await backend.find_similar(obs, threshold=0.7)
+        assert found is not None
+
+    async def test_find_similar_no_match_dissimilar(self, backend):
+        """Dissimilar descriptions don't match."""
+        await backend.store(Belief(
+            capability="train",
+            description="batch_size=64 works",
+            valence=Valence.POSITIVE,
+        ))
+
+        obs = Observation(
+            capability="train",
+            description="learning_rate=0.001 is optimal",
+            valence=Valence.POSITIVE,
+        )
+        found = await backend.find_similar(obs)
+        assert found is None
+
+    async def test_find_similar_lower_threshold(self, backend):
+        """Lowering threshold allows fuzzier matches."""
+        await backend.store(Belief(
+            capability="train",
+            description="batch_size=64 works great",
+            valence=Valence.POSITIVE,
+        ))
+
+        obs = Observation(
+            capability="train",
+            description="batch 64 great results observed",
+            valence=Valence.POSITIVE,
+        )
+        # Default threshold (0.85) might miss this
+        found_loose = await backend.find_similar(obs, threshold=0.3)
+        # Loose threshold should find it
+        assert found_loose is not None
 
 
 # ======================================================================
@@ -380,6 +511,131 @@ class TestMemoryLoop:
         descriptions = {b.description for b in remaining}
         assert "b0" not in descriptions
         assert "b1" not in descriptions
+
+    async def test_metric_shift_delta_snapshots_old_value(self, loop):
+        """Delta.old_belief captures pre-mutation state for metric shifts."""
+        loop.metric_shift_threshold = 0.1
+
+        obs1 = Observation(
+            capability="mining", description="batch=64",
+            valence=Valence.POSITIVE, metric_name="score", metric_value=0.8,
+        )
+        obs2 = Observation(
+            capability="mining", description="batch=64",
+            valence=Valence.POSITIVE, metric_name="score", metric_value=0.5,
+        )
+
+        await loop.assimilate(obs1)
+        delta = await loop.assimilate(obs2)
+
+        assert delta is not None
+        # old_belief should reflect pre-mutation state
+        assert delta.old_belief.metric_value == 0.8
+        # Stored belief should have the new value
+        beliefs = await loop.backend.all_beliefs()
+        assert beliefs[0].metric_value == 0.5
+
+    async def test_contradiction_delta_snapshots_old_confidence(self, loop):
+        """Delta.old_belief captures pre-mutation state for contradictions."""
+        pos = Observation(
+            capability="mining", description="batch=64",
+            valence=Valence.POSITIVE,
+        )
+        neg = Observation(
+            capability="mining", description="batch=64",
+            valence=Valence.NEGATIVE,
+        )
+
+        await loop.assimilate(pos)  # confidence=1.0
+        delta = await loop.assimilate(neg)
+
+        assert delta is not None
+        assert delta.old_belief.confidence == 1.0  # snapshot before weakening
+
+    async def test_metric_shift_does_not_strengthen(self, loop):
+        """Metric shift in agreement branch should not increase confidence/count."""
+        loop.metric_shift_threshold = 0.1
+
+        obs1 = Observation(
+            capability="mining", description="batch=64",
+            valence=Valence.POSITIVE, metric_name="score", metric_value=0.85,
+        )
+        obs2 = Observation(
+            capability="mining", description="batch=64",
+            valence=Valence.POSITIVE, metric_name="score", metric_value=0.45,
+        )
+
+        await loop.assimilate(obs1)
+        delta = await loop.assimilate(obs2)
+
+        assert delta is not None
+        assert delta.delta_type == "metric_shift"
+
+        beliefs = await loop.backend.all_beliefs()
+        b = beliefs[0]
+        # Should NOT have been strengthened
+        assert b.confidence <= 1.0  # not increased from initial 1.0
+        assert b.confirmation_count == 1  # not bumped to 2
+
+    async def test_stable_entity_merge_order(self, loop):
+        """Entity merging preserves existing order, appends new items."""
+        obs1 = Observation(
+            capability="mining", description="test order",
+            valence=Valence.POSITIVE, entities=("a", "b", "c"),
+        )
+        obs2 = Observation(
+            capability="mining", description="test order",
+            valence=Valence.POSITIVE, entities=("d", "b", "e"),
+        )
+
+        await loop.assimilate(obs1)
+        await loop.assimilate(obs2)
+
+        beliefs = await loop.backend.all_beliefs()
+        assert beliefs[0].entities == ("a", "b", "c", "d", "e")
+
+    async def test_concurrent_delta_safety(self, loop):
+        """Concurrent assimilate calls produce correct delta counts."""
+        loop.metric_shift_threshold = 0.01
+
+        # First, create a base belief
+        base_obs = Observation(
+            capability="mining", description="concurrent test",
+            valence=Valence.POSITIVE, metric_name="score", metric_value=1.0,
+        )
+        await loop.assimilate(base_obs)
+
+        # Create 10 contradicting observations to generate deltas
+        for i in range(10):
+            obs = Observation(
+                capability=f"cap_{i}",
+                description=f"unique obs {i}",
+                valence=Valence.POSITIVE,
+                metric_name="score",
+                metric_value=0.5,
+            )
+            # First assimilate to create belief
+            await loop.assimilate(obs)
+
+        # Now create contradictions concurrently
+        async def make_contradiction(idx: int) -> Delta | None:
+            obs = Observation(
+                capability=f"cap_{idx}",
+                description=f"unique obs {idx}",
+                valence=Valence.NEGATIVE,
+            )
+            return await loop.assimilate(obs)
+
+        results = await asyncio.gather(*[make_contradiction(i) for i in range(10)])
+        contradiction_deltas = [r for r in results if r is not None]
+
+        # All 10 should produce contradiction deltas
+        assert len(contradiction_deltas) == 10
+
+        # drain_deltas should have all of them
+        drained = await loop.drain_deltas()
+        assert len(drained) == 10
+        assert len(await loop.drain_deltas()) == 0  # second drain empty
 
 
 # ======================================================================
@@ -609,3 +865,33 @@ class TestFederation:
         descriptions = {b.description for b in results}
         assert "Beta" in descriptions
         assert "Alpha" not in descriptions
+
+
+# ======================================================================
+# JSON backend cache
+# ======================================================================
+
+@pytest.mark.asyncio
+class TestJsonCache:
+    async def test_cache_returns_same_data(self, json_backend):
+        """After storing, all_beliefs() uses cache on second call."""
+        for i in range(3):
+            await json_backend.store(Belief(
+                capability="x", description=f"b{i}", valence=Valence.POSITIVE,
+            ))
+
+        result1 = await json_backend.all_beliefs()
+        result2 = await json_backend.all_beliefs()
+        assert len(result1) == 3
+        assert len(result2) == 3
+        assert {b.description for b in result1} == {b.description for b in result2}
+
+    async def test_invalidate_cache(self, json_backend):
+        """invalidate_cache forces re-read from disk."""
+        await json_backend.store(Belief(
+            capability="x", description="cached", valence=Valence.POSITIVE,
+        ))
+        json_backend.invalidate_cache()
+        beliefs = await json_backend.all_beliefs()
+        assert len(beliefs) == 1
+        assert beliefs[0].description == "cached"

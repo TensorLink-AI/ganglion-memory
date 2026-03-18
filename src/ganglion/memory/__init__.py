@@ -6,6 +6,7 @@ from ganglion.memory.backends.federated import FederatedMemoryBackend, PeerDisco
 from ganglion.memory.backends.json_file import JsonMemoryBackend
 from ganglion.memory.backends.sqlite import SqliteMemoryBackend
 from ganglion.memory.loop import MemoryLoop
+from ganglion.memory.similarity import jaccard_similarity, tokenize
 from ganglion.memory.types import Belief, Delta, Observation, Valence
 
 __all__ = [
@@ -15,6 +16,9 @@ __all__ = [
     "Belief",
     "Delta",
     "Valence",
+    # Similarity
+    "jaccard_similarity",
+    "tokenize",
     # Agent integration
     "MemoryAgent",
     "between_runs",

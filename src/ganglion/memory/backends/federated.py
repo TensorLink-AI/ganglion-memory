@@ -96,6 +96,7 @@ class PeerDiscovery:
     ) -> list[Belief]:
         results: list[Belief] = []
         for peer in self._discover_peers():
+            peer.invalidate_cache()
             try:
                 results.extend(await peer.query(
                     capability=capability, valence=valence, entities=entities,

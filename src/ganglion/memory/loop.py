@@ -14,11 +14,24 @@ on the read path.
 
 from __future__ import annotations
 
+import asyncio
+import copy
 import logging
 from dataclasses import dataclass, field
 
 from ganglion.memory.backends.base import MemoryBackend
-from ganglion.memory.types import Belief, Delta, Observation, Valence
+from ganglion.memory.types import Belief, Delta, Observation
+
+
+def _stable_merge(existing: tuple[str, ...], new: tuple[str, ...]) -> tuple[str, ...]:
+    """Merge tuples preserving order of existing, appending new unseen items."""
+    seen = set(existing)
+    merged = list(existing)
+    for item in new:
+        if item not in seen:
+            seen.add(item)
+            merged.append(item)
+    return tuple(merged)
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +50,7 @@ class MemoryLoop:
     max_beliefs: int = 1000
 
     _pending_deltas: list[Delta] = field(default_factory=list)
+    _delta_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     # ------------------------------------------------------------------
     # Write path: the single primitive
@@ -71,23 +85,36 @@ class MemoryLoop:
         # Agreement: same valence
         if obs.valence == existing.valence:
             delta = self._check_metric_shift(existing, obs)
-            existing.confidence = min(10.0, existing.confidence + self.strengthen_rate)
-            existing.confirmation_count += 1
+
+            if delta is None:
+                # Pure agreement — strengthen
+                existing.confidence = min(10.0, existing.confidence + self.strengthen_rate)
+                existing.confirmation_count += 1
+            else:
+                # Metric shifted significantly — don't strengthen
+                # Optionally weaken proportionally if the shift is negative
+                if (obs.metric_value is not None and existing.metric_value is not None
+                        and obs.metric_value < existing.metric_value):
+                    existing.confidence = max(
+                        self.death_threshold,
+                        existing.confidence - self.weaken_rate * (delta.magnitude or 0)
+                    )
+
             existing.last_confirmed = obs.timestamp
             if obs.metric_value is not None:
                 existing.last_metric_value = existing.metric_value
                 existing.metric_value = obs.metric_value
-            # Merge any new entities/tags
-            existing.entities = tuple(set(existing.entities) | set(obs.entities))
-            existing.tags = tuple(set(existing.tags) | set(obs.tags))
+            existing.entities = _stable_merge(existing.entities, obs.entities)
+            existing.tags = _stable_merge(existing.tags, obs.tags)
             await self.backend.update(existing)
             if delta:
-                self._pending_deltas.append(delta)
+                async with self._delta_lock:
+                    self._pending_deltas.append(delta)
             return delta
 
         # Contradiction: different valence
         delta = Delta(
-            old_belief=existing,
+            old_belief=copy.copy(existing),
             new_observation=obs,
             delta_type="contradiction",
         )
@@ -114,7 +141,8 @@ class MemoryLoop:
         else:
             await self.backend.update(existing)
 
-        self._pending_deltas.append(delta)
+        async with self._delta_lock:
+            self._pending_deltas.append(delta)
         return delta
 
     def _check_metric_shift(self, belief: Belief, obs: Observation) -> Delta | None:
@@ -127,7 +155,7 @@ class MemoryLoop:
         shift = abs(obs.metric_value - belief.metric_value) / abs(belief.metric_value)
         if shift >= self.metric_shift_threshold:
             return Delta(
-                old_belief=belief,
+                old_belief=copy.copy(belief),
                 new_observation=obs,
                 delta_type="metric_shift",
                 magnitude=shift,
@@ -136,9 +164,10 @@ class MemoryLoop:
 
     async def drain_deltas(self) -> list[Delta]:
         """Collect and clear pending deltas."""
-        deltas = self._pending_deltas.copy()
-        self._pending_deltas.clear()
-        return deltas
+        async with self._delta_lock:
+            deltas = self._pending_deltas.copy()
+            self._pending_deltas.clear()
+            return deltas
 
     # ------------------------------------------------------------------
     # Read path: prompt context generation
