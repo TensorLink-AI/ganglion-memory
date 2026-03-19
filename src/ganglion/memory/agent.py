@@ -3,9 +3,9 @@ Agent integration for the memory loop.
 
 Three touch points, any agent, any task:
 
-    1. BEFORE acting  → remember() → inject context into prompt
-    2. AFTER acting    → learn(result) → feed outcome into memory
-    3. BETWEEN runs   → drain_deltas() + forget()
+    1. BEFORE acting  -> remember(query=...) -> inject context into prompt
+    2. AFTER acting    -> learn(result, input_text=..., output_text=...) -> feed outcome
+    3. BETWEEN runs   -> between_runs() -> synthesize + forget
 
 The agent itself doesn't know about memory. It receives a richer
 prompt and reports what happened. That's it.
@@ -81,9 +81,10 @@ class MemoryAgent:
     Usage:
         agent = MemoryAgent(memory=loop, capability="mining", bot_id="alpha")
 
-        context = await agent.remember()           # inject into prompt
+        context = await agent.remember(query="optimize batch size")
         result = await my_agent.run(context=context)
-        delta = await agent.learn(result)           # feed back
+        delta = await agent.learn(result, input_text="optimize batch size",
+                                   output_text=str(result))
     """
 
     memory: MemoryLoop
@@ -95,13 +96,18 @@ class MemoryAgent:
     context_limit: int = 10
     include_foreign: bool = True
 
-    async def remember(self) -> str:
-        """BEFORE acting. Build prompt context from memory."""
+    async def remember(self, query: str = "") -> str:
+        """BEFORE acting. Build prompt context from memory.
+
+        When query is provided, retrieves beliefs relevant to the
+        current input rather than just top-N by strength.
+        """
         parts: list[str] = []
 
         # Own knowledge
         own = await self.memory.context_for(
             capability=self.capability,
+            query=query,
             entities=self.entities,
             tags=self.tags,
             max_entries=self.context_limit,
@@ -113,6 +119,7 @@ class MemoryAgent:
         if self.include_foreign and self.bot_id:
             foreign = await self.memory.context_for(
                 capability=self.capability,
+                query=query,
                 entities=self.entities,
                 tags=self.tags,
                 exclude_source=self.bot_id,
@@ -133,8 +140,18 @@ class MemoryAgent:
 
         return "\n\n".join(parts)
 
-    async def learn(self, result: dict[str, Any]) -> Delta | None:
-        """AFTER acting. Feed the outcome into memory."""
+    async def learn(
+        self,
+        result: dict[str, Any],
+        input_text: str = "",
+        output_text: str = "",
+    ) -> Delta | None:
+        """AFTER acting. Feed the outcome into memory.
+
+        When input_text and output_text are provided and reflection is
+        configured, uses LLM-based reflection instead of simple result
+        parsing.
+        """
         obs = result_to_observation(
             capability=self.capability,
             result=result,
@@ -150,13 +167,42 @@ class MemoryAgent:
 # Run boundary helper
 # ------------------------------------------------------------------
 
-async def between_runs(memory: MemoryLoop) -> list[Delta]:
-    """BETWEEN runs. Drain deltas and forget weak beliefs."""
+async def between_runs(
+    memory: MemoryLoop,
+    llm_client: Any = None,
+    model: str = "claude-haiku",
+) -> list[Delta]:
+    """BETWEEN runs. Synthesize insights, drain deltas, forget weak beliefs.
+
+    With an LLM client: reasons over accumulated beliefs to produce
+    meta-insights before forgetting.
+    Without: just drains deltas and forgets (same as before).
+    """
     deltas = await memory.drain_deltas()
     if deltas:
         logger.info("Memory shifts this run: %d", len(deltas))
         for d in deltas:
             logger.info("  %s", d.summary)
+
+    # Synthesis: reason over beliefs to produce meta-insights
+    if llm_client is not None:
+        try:
+            from ganglion.memory.synthesize import synthesize
+            recent_beliefs = await memory.backend.query(limit=50)
+            observations = await synthesize(
+                beliefs=recent_beliefs,
+                deltas=deltas,
+                model=model,
+                llm_client=llm_client,
+                capability=recent_beliefs[0].capability if recent_beliefs else "general",
+            )
+            for obs in observations:
+                await memory.assimilate(obs)
+            if observations:
+                logger.info("Synthesized %d meta-insights", len(observations))
+        except Exception as e:
+            logger.warning("Synthesis failed: %s", e)
+
     forgotten = await memory.forget()
     if forgotten:
         logger.info("Forgot %d weak beliefs", forgotten)

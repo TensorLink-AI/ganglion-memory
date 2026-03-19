@@ -1,7 +1,8 @@
 """Backend protocol for memory storage.
 
-One protocol. Six methods. Replaces the old KnowledgeBackend (11 methods)
-and PeerDiscovery (2 methods) with a single contract.
+One protocol. Six methods. The embedding field on Belief is stored and
+returned transparently — backends that support it store embedding blobs,
+others ignore it.
 """
 
 from __future__ import annotations
@@ -14,16 +15,21 @@ from ganglion.memory.types import Belief, Observation, Valence
 class MemoryBackend(Protocol):
     """The only contract backends must satisfy.
 
-    find_similar is the only method that needs domain-specific thought.
-    Everything else is mechanical CRUD.
+    find_similar uses cosine similarity on embeddings when available,
+    falling back to Jaccard token similarity.
     """
 
     async def find_similar(
         self,
         observation: Observation,
-        threshold: float = 0.85,
+        threshold: float = 0.75,
+        embedding: list[float] | None = None,
     ) -> Belief | None:
-        """Find the existing belief most similar to this observation."""
+        """Find the existing belief most similar to this observation.
+
+        If embedding is provided, uses cosine similarity.
+        Falls back to Jaccard on description text.
+        """
         ...
 
     async def store(self, belief: Belief) -> None:

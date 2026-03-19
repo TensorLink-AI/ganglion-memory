@@ -1074,8 +1074,7 @@ class TestInhibition:
         assert alt_after.confidence >= conf_before
 
     async def test_inhibition_floor(self, loop):
-        """Inhibition cannot push confidence below the floor."""
-        loop.inhibition_floor = 0.2
+        """Inhibition cannot push confidence below the floor (hardcoded at 0.2)."""
 
         await loop.backend.store(Belief(
             capability="mining", description="batch=64",
@@ -1227,57 +1226,13 @@ class TestConsolidation:
 
 
 # ======================================================================
-# Cross-agent confirmation weighting
+# Source-agnostic strengthening (cross_agent_bonus removed in v2)
 # ======================================================================
 
 @pytest.mark.asyncio
-class TestCrossAgentBonus:
-    async def test_cross_agent_confirmation_bonus(self, loop):
-        """Different-source confirmation strengthens more than same-source."""
-        # Agent alpha discovers something
-        await loop.assimilate(Observation(
-            capability="mining", description="batch=64 works",
-            valence=Valence.POSITIVE, source="alpha",
-        ))
-        beliefs = await loop.backend.all_beliefs()
-        confidence_after_1 = beliefs[0].confidence
-
-        # Alpha confirms its own finding
-        await loop.assimilate(Observation(
-            capability="mining", description="batch=64 works",
-            valence=Valence.POSITIVE, source="alpha",
-        ))
-        beliefs = await loop.backend.all_beliefs()
-        confidence_after_self = beliefs[0].confidence
-        self_boost = confidence_after_self - confidence_after_1
-
-        # Reset — start fresh
-        for b in await loop.backend.all_beliefs():
-            await loop.backend.remove(b)
-
-        # Agent alpha discovers again
-        await loop.assimilate(Observation(
-            capability="mining", description="batch=64 works",
-            valence=Valence.POSITIVE, source="alpha",
-        ))
-        beliefs = await loop.backend.all_beliefs()
-        confidence_after_1b = beliefs[0].confidence
-
-        # Agent BETA confirms (independent replication)
-        await loop.assimilate(Observation(
-            capability="mining", description="batch=64 works",
-            valence=Valence.POSITIVE, source="beta",
-        ))
-        beliefs = await loop.backend.all_beliefs()
-        confidence_after_cross = beliefs[0].confidence
-        cross_boost = confidence_after_cross - confidence_after_1b
-
-        assert cross_boost > self_boost
-
-    async def test_cross_agent_bonus_disabled(self, loop):
-        """cross_agent_bonus=1.0 gives same boost regardless of source."""
-        loop.cross_agent_bonus = 1.0
-
+class TestSourceAgnosticStrengthening:
+    async def test_all_sources_get_same_strengthen_rate(self, loop):
+        """All confirmations use the same strengthen_rate regardless of source."""
         await loop.assimilate(Observation(
             capability="mining", description="batch=64 works",
             valence=Valence.POSITIVE, source="alpha",
@@ -1285,17 +1240,17 @@ class TestCrossAgentBonus:
         beliefs = await loop.backend.all_beliefs()
         c1 = beliefs[0].confidence
 
+        # Cross-agent confirmation: same rate as self-confirmation
         await loop.assimilate(Observation(
             capability="mining", description="batch=64 works",
             valence=Valence.POSITIVE, source="beta",
         ))
         beliefs = await loop.backend.all_beliefs()
-        cross_boost = beliefs[0].confidence - c1
+        boost = beliefs[0].confidence - c1
 
-        # Should be same as strengthen_rate (no bonus)
-        assert abs(cross_boost - loop.strengthen_rate) < 0.001
+        assert abs(boost - loop.strengthen_rate) < 0.001
 
-    async def test_no_bonus_when_sources_match(self, loop):
+    async def test_same_source_gets_strengthen_rate(self, loop):
         """Same-source confirmation gets normal strengthen_rate."""
         await loop.assimilate(Observation(
             capability="mining", description="batch=64 works",
@@ -1313,57 +1268,15 @@ class TestCrossAgentBonus:
 
         assert abs(boost - loop.strengthen_rate) < 0.001
 
-    async def test_no_bonus_when_source_is_none(self, loop):
-        """No bonus when either source is None."""
-        await loop.assimilate(Observation(
-            capability="mining", description="batch=64 works",
-            valence=Valence.POSITIVE, source=None,
-        ))
-        beliefs = await loop.backend.all_beliefs()
-        c1 = beliefs[0].confidence
-
-        await loop.assimilate(Observation(
-            capability="mining", description="batch=64 works",
-            valence=Valence.POSITIVE, source="beta",
-        ))
-        beliefs = await loop.backend.all_beliefs()
-        boost = beliefs[0].confidence - c1
-
-        assert abs(boost - loop.strengthen_rate) < 0.001
-
 
 # ======================================================================
-# Exploration pressure
+# Strength-based ranking (exploration_rate removed in v2)
 # ======================================================================
 
 @pytest.mark.asyncio
-class TestExploration:
-    async def test_exploration_can_surface_weak_beliefs(self, tmp_dir):
-        """With exploration, weak beliefs occasionally outrank strong ones."""
-        backend = JsonMemoryBackend(tmp_dir / "memory")
-        loop = MemoryLoop(backend=backend, exploration_rate=2.0)  # high noise
-
-        for _ in range(10):
-            await loop.assimilate(Observation(
-                capability="x", description="dominant",
-                valence=Valence.POSITIVE,
-            ))
-        await loop.assimilate(Observation(
-            capability="x", description="underdog",
-            valence=Valence.POSITIVE,
-        ))
-
-        # With high exploration, the underdog should surface at least once in 20 tries
-        found = False
-        for _ in range(20):
-            ctx = await loop.context_for("x", max_entries=1)
-            if "underdog" in ctx:
-                found = True
-                break
-        assert found
-
-    async def test_exploration_off_by_default(self, loop):
-        """With default exploration_rate=0.0, only strongest beliefs appear."""
+class TestStrengthRanking:
+    async def test_strongest_beliefs_surface_first(self, loop):
+        """Without embeddings, strongest beliefs appear first."""
         for _ in range(10):
             await loop.assimilate(Observation(
                 capability="x", description="dominant",
@@ -1374,7 +1287,7 @@ class TestExploration:
             valence=Valence.POSITIVE,
         ))
 
-        # With exploration off, the weak belief should never appear in max_entries=1
+        # Only strongest belief should appear in max_entries=1
         for _ in range(10):
             ctx = await loop.context_for("x", max_entries=1)
             assert "weak" not in ctx
@@ -1442,7 +1355,7 @@ class TestStrategyBundling:
 class TestCrisisDetection:
     async def test_crisis_mode_accelerates_weakening(self, loop):
         """Consecutive contradictions make the system more plastic."""
-        loop.crisis_multiplier = 3.0
+        # crisis acceleration is built-in (3.0x after 3 consecutive contradictions)
 
         # Establish a strong belief
         for _ in range(5):
@@ -1471,7 +1384,7 @@ class TestCrisisDetection:
 
     async def test_agreement_resets_crisis(self, loop):
         """One agreement resets the contradiction streak."""
-        loop.crisis_multiplier = 3.0
+        # crisis acceleration is built-in (3.0x after 3 consecutive contradictions)
 
         await loop.assimilate(Observation(
             capability="x", description="strategy A",
@@ -1496,12 +1409,10 @@ class TestCrisisDetection:
         ))
         assert loop._contradiction_streak == 0
 
-    async def test_crisis_disabled_at_multiplier_one(self, loop):
-        """crisis_multiplier=1.0 means no acceleration."""
-        loop.crisis_multiplier = 1.0
-
-        # Build up high confidence so it survives all contradictions
-        for _ in range(10):
+    async def test_crisis_accelerates_after_three(self, loop):
+        """Crisis mode kicks in at exactly 3 consecutive contradictions."""
+        # Build up moderate confidence
+        for _ in range(5):
             await loop.assimilate(Observation(
                 capability="x", description="belief",
                 valence=Valence.POSITIVE,
@@ -1510,22 +1421,36 @@ class TestCrisisDetection:
         beliefs = await loop.backend.all_beliefs()
         conf_before = beliefs[0].confidence
 
-        for _ in range(5):
-            await loop.assimilate(Observation(
-                capability="x", description="belief",
-                valence=Valence.NEGATIVE,
-            ))
+        # First two contradictions: normal weaken_rate
+        await loop.assimilate(Observation(
+            capability="x", description="belief",
+            valence=Valence.NEGATIVE,
+        ))
+        await loop.assimilate(Observation(
+            capability="x", description="belief",
+            valence=Valence.NEGATIVE,
+        ))
 
         beliefs = await loop.backend.all_beliefs()
-        old = [b for b in beliefs if "belief" in b.description]
-        if old:
-            total_drop = conf_before - old[0].confidence
-            # Should be exactly 5 × 0.3 = 1.5 (no acceleration)
-            assert abs(total_drop - 5 * loop.weaken_rate) < 0.01
+        old = [b for b in beliefs if "belief" in b.description][0]
+        drop_after_2 = conf_before - old.confidence
+        # Should be 2 × 0.3 = 0.6
+        assert abs(drop_after_2 - 2 * loop.weaken_rate) < 0.01
+
+        # Third contradiction: crisis kicks in (3.0x multiplier)
+        await loop.assimilate(Observation(
+            capability="x", description="belief",
+            valence=Valence.NEGATIVE,
+        ))
+        beliefs = await loop.backend.all_beliefs()
+        old = [b for b in beliefs if "belief" in b.description][0]
+        total_drop = conf_before - old.confidence
+        # Should be 0.3 + 0.3 + 0.9 = 1.5 (third hit is 3x)
+        assert total_drop > 2 * loop.weaken_rate + loop.weaken_rate * 1.5
 
     async def test_streak_decays_on_forget(self, loop):
         """Between-runs decay prevents slow-burn false crises."""
-        loop.crisis_multiplier = 3.0
+        # crisis acceleration is built-in (3.0x after 3 consecutive contradictions)
 
         await loop.assimilate(Observation(
             capability="x", description="A",

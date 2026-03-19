@@ -1,9 +1,10 @@
-"""Simple token-based similarity for belief matching.
+"""Similarity functions for belief matching.
 
-No external dependencies. For embedding-based similarity, subclass
-the backend and override find_similar.
+Primary: cosine similarity on embeddings (via embed.py).
+Fallback: Jaccard token similarity (no external dependencies).
 """
 
+import math
 import re
 
 
@@ -21,3 +22,15 @@ def jaccard_similarity(a: str, b: str) -> float:
     intersection = tokens_a & tokens_b
     union = tokens_a | tokens_b
     return len(intersection) / len(union)
+
+
+def cosine_similarity(a: list[float], b: list[float]) -> float:
+    """Cosine similarity between two embedding vectors."""
+    if len(a) != len(b) or not a:
+        return 0.0
+    dot = sum(x * y for x, y in zip(a, b))
+    norm_a = math.sqrt(sum(x * x for x in a))
+    norm_b = math.sqrt(sum(x * x for x in b))
+    if norm_a == 0.0 or norm_b == 0.0:
+        return 0.0
+    return dot / (norm_a * norm_b)

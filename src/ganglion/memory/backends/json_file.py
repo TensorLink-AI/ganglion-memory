@@ -1,8 +1,7 @@
 """JSON file backend for memory storage.
 
-One file (beliefs.json) replaces patterns.json + antipatterns.json +
-agent_designs.json. Good for development, single-bot deployments,
-and as the building block for federated peer discovery.
+One file (beliefs.json). Embedding vectors stored as base64 strings.
+Cosine similarity used when embeddings available, Jaccard fallback otherwise.
 """
 
 from __future__ import annotations
@@ -19,7 +18,7 @@ logger = logging.getLogger(__name__)
 
 
 class JsonMemoryBackend:
-    """Single-file JSON storage for beliefs."""
+    """Single-file JSON storage for beliefs with embedding support."""
 
     def __init__(self, directory: str | Path):
         self.directory = Path(directory)
@@ -95,21 +94,37 @@ class JsonMemoryBackend:
     def _find_similar_sync(
         self,
         observation: Observation,
-        threshold: float = 0.85,
+        threshold: float = 0.75,
+        embedding: list[float] | None = None,
     ) -> Belief | None:
-        from ganglion.memory.similarity import jaccard_similarity
-
         data = self._load_sync()
         best_match: Belief | None = None
         best_score = 0.0
 
-        for d in data:
-            if d.get("capability") != observation.capability:
-                continue
-            if d.get("superseded_by"):
-                continue
+        candidates = [
+            d for d in data
+            if d.get("capability") == observation.capability
+            and not d.get("superseded_by")
+        ]
+
+        if embedding is not None:
+            from ganglion.memory.similarity import cosine_similarity
+            for d in candidates:
+                belief = Belief.from_dict(d)
+                if belief.embedding is not None:
+                    score = cosine_similarity(embedding, belief.embedding)
+                    if score >= threshold and score > best_score:
+                        best_score = score
+                        best_match = belief
+            if best_match is not None:
+                return best_match
+
+        # Fallback to Jaccard
+        from ganglion.memory.similarity import jaccard_similarity
+        jaccard_threshold = max(threshold, 0.85) if embedding is not None else threshold
+        for d in candidates:
             score = jaccard_similarity(observation.description, d.get("description", ""))
-            if score >= threshold and score > best_score:
+            if score >= jaccard_threshold and score > best_score:
                 best_score = score
                 best_match = Belief.from_dict(d)
 
@@ -118,9 +133,12 @@ class JsonMemoryBackend:
     async def find_similar(
         self,
         observation: Observation,
-        threshold: float = 0.85,
+        threshold: float = 0.75,
+        embedding: list[float] | None = None,
     ) -> Belief | None:
-        return await asyncio.to_thread(self._find_similar_sync, observation, threshold)
+        return await asyncio.to_thread(
+            self._find_similar_sync, observation, threshold, embedding,
+        )
 
     def _query_sync(
         self,

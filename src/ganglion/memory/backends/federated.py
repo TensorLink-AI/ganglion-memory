@@ -23,8 +23,13 @@ class FederatedMemoryBackend:
         self.local = local
         self.peers = peers
 
-    async def find_similar(self, observation: Observation, threshold: float = 0.85) -> Belief | None:
-        return await self.local.find_similar(observation, threshold)
+    async def find_similar(
+        self,
+        observation: Observation,
+        threshold: float = 0.75,
+        embedding: list[float] | None = None,
+    ) -> Belief | None:
+        return await self.local.find_similar(observation, threshold, embedding)
 
     async def store(self, belief: Belief) -> None:
         await self.local.store(belief)

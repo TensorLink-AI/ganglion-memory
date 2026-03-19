@@ -1,15 +1,14 @@
 """
 MemoryLoop — the single primitive.
 
-Replaces KnowledgeStore (record_success, record_failure, record_agent_design,
-to_prompt_context, to_foreign_prompt_context, trim) with one method: assimilate().
-
     for each observation:
         memory.assimilate(observation)
 
 Everything else — strengthening, weakening, contradiction detection,
 entity profiling, eviction — happens inside that single call or
 on the read path.
+
+v2: Embedding-based similarity, query-aware context, simplified knobs.
 """
 
 from __future__ import annotations
@@ -18,10 +17,10 @@ import asyncio
 import copy
 import logging
 import math
-import random
 from dataclasses import dataclass, field
 
 from ganglion.memory.backends.base import MemoryBackend
+from ganglion.memory.embed import Embedder, cosine_similarity
 from ganglion.memory.types import Belief, Delta, Observation, Valence
 
 logger = logging.getLogger(__name__)
@@ -40,51 +39,68 @@ def _stable_merge(existing: tuple[str, ...], new: tuple[str, ...]) -> tuple[str,
 
 @dataclass
 class MemoryLoop:
-    """One loop. Five contexts. No special cases."""
+    """One loop. Five contexts. No special cases.
+
+    Tuning knobs (6 that matter):
+        strengthen_rate     — confidence boost on agreement
+        weaken_rate         — confidence drop on contradiction
+        death_threshold     — confidence below which beliefs die
+        max_beliefs         — capacity limit
+        consolidation_threshold — cosine/Jaccard threshold for merging
+        inhibition_rate     — lateral inhibition strength (0 to disable)
+    """
 
     backend: MemoryBackend
+    embedder: Embedder | None = None
 
-    # Tuning knobs
+    # Core mechanics
     strengthen_rate: float = 0.1
     weaken_rate: float = 0.3
     death_threshold: float = 0.1
-    metric_shift_threshold: float = 0.15
     max_beliefs: int = 1000
+    consolidation_threshold: float = 0.5
+    inhibition_rate: float = 0.05
 
-    # Salience: surprise-gated encoding
+    # Salience: surprise-gated encoding (internal heuristic)
     salience: bool = True
 
-    # Lateral inhibition on agreement
-    inhibition_rate: float = 0.05
-    inhibition_floor: float = 0.2
-
-    # Cross-agent confirmation weighting
-    cross_agent_bonus: float = 2.0
-
-    # Exploration pressure in context_for()
-    exploration_rate: float = 0.0
-
-    # Crisis detection: accelerate weakening on consecutive contradictions
-    crisis_multiplier: float = 3.0
-
-    # Consolidation Jaccard threshold for forget()
-    consolidation_threshold: float = 0.5
+    # Metric shift detection
+    metric_shift_threshold: float = 0.15
 
     _pending_deltas: list[Delta] = field(default_factory=list)
     _delta_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     _contradiction_streak: int = 0
 
     # ------------------------------------------------------------------
+    # Embedding helper
+    # ------------------------------------------------------------------
+
+    async def _embed(self, text: str) -> list[float] | None:
+        """Embed text using the configured embedder, or None."""
+        if self.embedder is None:
+            return None
+        try:
+            return await self.embedder.embed(text)
+        except Exception as e:
+            logger.debug("Embedding failed: %s", e)
+            return None
+
+    # ------------------------------------------------------------------
     # Write path: the single primitive
     # ------------------------------------------------------------------
 
     async def assimilate(self, obs: Observation) -> Delta | None:
-        """Observe → Compare → Update.
+        """Observe -> Compare -> Update.
 
         The ONLY write path into memory. Returns a Delta if something
         meaningful changed, None otherwise.
         """
-        existing = await self.backend.find_similar(obs)
+        # Compute embedding for the observation
+        obs_embedding = await self._embed(obs.description)
+
+        existing = await self.backend.find_similar(
+            obs, threshold=0.75, embedding=obs_embedding,
+        )
 
         # Strategy bundling: include run tag when run_id is present
         run_tags = (f"run:{obs.run_id}",) if obs.run_id else ()
@@ -93,7 +109,7 @@ class MemoryLoop:
         if existing is None:
             # Novel observation — compute salience for initial confidence
             confidence = await self._compute_salience(obs) if self.salience else 1.0
-            await self.backend.store(Belief(
+            belief = Belief(
                 capability=obs.capability,
                 description=obs.description,
                 valence=obs.valence,
@@ -107,7 +123,9 @@ class MemoryLoop:
                 tags=obs_tags,
                 first_seen=obs.timestamp,
                 last_confirmed=obs.timestamp,
-            ))
+                embedding=obs_embedding,
+            )
+            await self.backend.store(belief)
             return None
 
         # Agreement: same valence
@@ -117,21 +135,10 @@ class MemoryLoop:
 
             if delta is None:
                 # Pure agreement — strengthen
-                # Cross-agent confirmation is worth more than self-confirmation
-                rate = self.strengthen_rate
-                if (
-                    self.cross_agent_bonus > 1.0
-                    and obs.source
-                    and existing.source
-                    and obs.source != existing.source
-                ):
-                    rate *= self.cross_agent_bonus
-
-                existing.confidence = min(10.0, existing.confidence + rate)
+                existing.confidence = min(10.0, existing.confidence + self.strengthen_rate)
                 existing.confirmation_count += 1
             else:
                 # Metric shifted significantly — don't strengthen
-                # Optionally weaken proportionally if the shift is negative
                 if (obs.metric_value is not None and existing.metric_value is not None
                         and obs.metric_value < existing.metric_value):
                     existing.confidence = max(
@@ -145,11 +152,14 @@ class MemoryLoop:
                 existing.metric_value = obs.metric_value
             existing.entities = _stable_merge(existing.entities, obs.entities)
             existing.tags = _stable_merge(existing.tags, obs_tags)
+            # Update embedding if we have a new one
+            if obs_embedding is not None:
+                existing.embedding = obs_embedding
             await self.backend.update(existing)
 
             # Lateral inhibition — weaken competitors on agreement
             if self.inhibition_rate > 0:
-                await self._inhibit_competitors(existing)
+                await self._inhibit_competitors(existing, obs_embedding)
 
             if delta:
                 async with self._delta_lock:
@@ -164,10 +174,10 @@ class MemoryLoop:
         )
         self._contradiction_streak += 1
 
-        # Crisis mode: consecutive contradictions increase plasticity
+        # Crisis mode: consecutive contradictions (>=3) increase plasticity
         effective_weaken = self.weaken_rate
-        if self._contradiction_streak >= 3 and self.crisis_multiplier > 1.0:
-            effective_weaken *= self.crisis_multiplier
+        if self._contradiction_streak >= 3:
+            effective_weaken *= 3.0
 
         existing.confidence -= effective_weaken
 
@@ -188,6 +198,7 @@ class MemoryLoop:
                 tags=obs_tags,
                 first_seen=obs.timestamp,
                 last_confirmed=obs.timestamp,
+                embedding=obs_embedding,
             ))
         else:
             await self.backend.update(existing)
@@ -235,17 +246,16 @@ class MemoryLoop:
         boost = 1.0 + (max_boost - 1.0) * min(z / 2.0, 1.0)
         return boost
 
-    async def _inhibit_competitors(self, strengthened: Belief) -> int:
+    async def _inhibit_competitors(
+        self,
+        strengthened: Belief,
+        embedding: list[float] | None = None,
+    ) -> int:
         """Weaken beliefs competing with the strengthened one.
 
-        A competitor has same capability, overlapping entities/tags,
-        but DIFFERENT description. Same-description beliefs are allies.
-        Confidence floors at self.inhibition_floor.
+        Uses embedding similarity when available, falls back to
+        entity/tag overlap.
         """
-        strengthened_features = set(strengthened.entities) | set(strengthened.tags)
-        if not strengthened_features:
-            return 0
-
         competitors = await self.backend.query(
             capability=strengthened.capability,
             limit=50,
@@ -258,18 +268,27 @@ class MemoryLoop:
             if comp.description == strengthened.description:
                 continue
 
-            comp_features = set(comp.entities) | set(comp.tags)
-            if not comp_features:
-                continue
-
-            overlap = len(strengthened_features & comp_features) / len(
-                strengthened_features | comp_features
-            )
-            if overlap < 0.2:
-                continue
+            # Compute overlap score
+            overlap = 0.0
+            if embedding is not None and comp.embedding is not None:
+                # Semantic similarity
+                overlap = cosine_similarity(embedding, comp.embedding)
+                if overlap < 0.3:
+                    continue
+            else:
+                # Fallback: entity/tag overlap
+                strengthened_features = set(strengthened.entities) | set(strengthened.tags)
+                comp_features = set(comp.entities) | set(comp.tags)
+                if not strengthened_features or not comp_features:
+                    continue
+                overlap = len(strengthened_features & comp_features) / len(
+                    strengthened_features | comp_features
+                )
+                if overlap < 0.2:
+                    continue
 
             reduction = self.inhibition_rate * overlap
-            comp.confidence = max(self.inhibition_floor, comp.confidence - reduction)
+            comp.confidence = max(0.2, comp.confidence - reduction)
             await self.backend.update(comp)
             inhibited += 1
 
@@ -289,6 +308,7 @@ class MemoryLoop:
     async def context_for(
         self,
         capability: str,
+        query: str = "",
         entities: tuple[str, ...] = (),
         exclude_source: str | None = None,
         tags: tuple[str, ...] = (),
@@ -296,33 +316,58 @@ class MemoryLoop:
     ) -> str:
         """Generate prompt-injectable context.
 
-        Consolidation happens HERE, on read. Beliefs are ranked by
-        strength so the most confirmed + most recent surface first.
-        No separate compaction pass needed.
+        When a query is provided and embeddings are available, ranks
+        beliefs by relevance to the current input. Otherwise falls
+        back to strength-based ranking.
         """
         beliefs = await self.backend.query(
             capability=capability,
             entities=entities,
             exclude_source=exclude_source,
             tags=tags,
-            limit=max_entries * 2,
+            limit=max_entries * 5,
         )
 
         if not beliefs:
             return ""
 
-        if self.exploration_rate > 0:
-            beliefs.sort(
-                key=lambda b: b.strength + random.gauss(0, self.exploration_rate * b.strength),
-                reverse=True,
-            )
-        else:
-            beliefs.sort(key=lambda b: b.strength, reverse=True)
+        # Query-aware ranking via embeddings
+        if query and self.embedder is not None:
+            query_embedding = await self._embed(query)
+            if query_embedding is not None:
+                scored = []
+                for b in beliefs:
+                    if b.embedding is not None:
+                        relevance = cosine_similarity(query_embedding, b.embedding)
+                    else:
+                        relevance = 0.0
+                    # Blend relevance with strength for final score
+                    score = relevance * 0.7 + min(b.strength / 10.0, 1.0) * 0.3
+                    scored.append((b, score))
+                scored.sort(key=lambda x: x[1], reverse=True)
+                # Filter by minimum relevance
+                beliefs = [b for b, score in scored[:max_entries] if score > 0.1]
+                if beliefs:
+                    return self._format_context(beliefs, query)
 
+        # Fallback: strength-based ranking
+        beliefs.sort(key=lambda b: b.strength, reverse=True)
         beliefs = beliefs[:max_entries]
+
+        return self._format_context(beliefs)
+
+    def _format_context(
+        self,
+        beliefs: list[Belief],
+        query: str = "",
+    ) -> str:
+        """Format beliefs as structured context."""
+        if not beliefs:
+            return ""
 
         patterns = [b for b in beliefs if b.is_pattern]
         antipatterns = [b for b in beliefs if b.is_antipattern]
+        neutral = [b for b in beliefs if b.valence == Valence.NEUTRAL]
 
         lines: list[str] = ["## What we know"]
 
@@ -339,13 +384,37 @@ class MemoryLoop:
                 conf = f" [confirmed {b.confirmation_count}x]" if b.confirmation_count > 1 else ""
                 lines.append(f"- {b.description}{conf}")
 
+        if neutral:
+            lines.append("\n### Observations")
+            for b in neutral:
+                conf = f" [confirmed {b.confirmation_count}x]" if b.confirmation_count > 1 else ""
+                lines.append(f"- {b.description}{conf}")
+
+        # Flag contradictions
+        contradictions = self._find_contradictions(beliefs)
+        if contradictions:
+            lines.append("\n### Contradictions (investigate)")
+            for a, b in contradictions:
+                lines.append(f"- '{a.description}' vs '{b.description}'")
+
         return "\n".join(lines)
 
-    async def entity_profile(self, entity: str) -> str:
-        """Everything we know about one entity.
+    def _find_contradictions(self, beliefs: list[Belief]) -> list[tuple[Belief, Belief]]:
+        """Find pairs of beliefs that contradict each other."""
+        contradictions = []
+        for i, a in enumerate(beliefs):
+            for b in beliefs[i + 1:]:
+                if a.valence != b.valence and a.valence != Valence.NEUTRAL and b.valence != Valence.NEUTRAL:
+                    # Check if they're about the same thing
+                    if a.embedding is not None and b.embedding is not None:
+                        if cosine_similarity(a.embedding, b.embedding) > 0.6:
+                            contradictions.append((a, b))
+                    elif set(a.entities) & set(b.entities):
+                        contradictions.append((a, b))
+        return contradictions
 
-        Not a separate store — a view over the same beliefs.
-        """
+    async def entity_profile(self, entity: str) -> str:
+        """Everything we know about one entity."""
         beliefs = await self.backend.query(entities=(entity,), limit=50)
         if not beliefs:
             return f"No knowledge about '{entity}'."
@@ -386,7 +455,6 @@ class MemoryLoop:
         # Phase 1: consolidation — compress before evicting
         consolidated = await self._consolidate(all_beliefs)
         if consolidated > 0:
-            # Re-read after consolidation changed the store
             all_beliefs = await self.backend.all_beliefs()
 
         # Decay contradiction streak between runs (crisis is transient)
@@ -432,7 +500,7 @@ class MemoryLoop:
         return removed
 
     def _cluster_by_overlap(self, beliefs: list[Belief]) -> list[list[Belief]]:
-        """Seed-anchored clustering — no feature expansion, no chaining."""
+        """Seed-anchored clustering using embeddings or entity/tag overlap."""
         assigned: set[int | None] = set()
         clusters: list[list[Belief]] = []
 
@@ -441,20 +509,25 @@ class MemoryLoop:
                 continue
             cluster = [b]
             assigned.add(b.id)
-            seed_features = set(b.entities) | set(b.tags)
-            if not seed_features:
-                continue
 
             for other in beliefs:
                 if other.id in assigned:
                     continue
-                other_features = set(other.entities) | set(other.tags)
-                if not other_features:
-                    continue
-                jaccard = len(seed_features & other_features) / len(
-                    seed_features | other_features
-                )
-                if jaccard >= self.consolidation_threshold:
+
+                similarity = 0.0
+                # Try embedding similarity first
+                if b.embedding is not None and other.embedding is not None:
+                    similarity = cosine_similarity(b.embedding, other.embedding)
+                else:
+                    # Fallback to entity/tag Jaccard
+                    seed_features = set(b.entities) | set(b.tags)
+                    other_features = set(other.entities) | set(other.tags)
+                    if seed_features and other_features:
+                        similarity = len(seed_features & other_features) / len(
+                            seed_features | other_features
+                        )
+
+                if similarity >= self.consolidation_threshold:
                     cluster.append(other)
                     assigned.add(other.id)
 
@@ -491,4 +564,5 @@ def _merge_cluster(cluster: list[Belief]) -> Belief:
         first_seen=min(b.first_seen for b in cluster),
         last_confirmed=max(b.last_confirmed for b in cluster),
         tags=tuple(all_tags),
+        embedding=strongest.embedding,
     )

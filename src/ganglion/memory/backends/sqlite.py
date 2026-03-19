@@ -1,8 +1,7 @@
 """SQLite backend for memory storage.
 
-One table. One schema. Replaces the old patterns + antipatterns +
-agent_designs triple with a single beliefs table where the valence
-column distinguishes positive/negative/neutral.
+One table. One schema. Embedding vectors stored as binary blobs.
+Cosine similarity used when embeddings available, Jaccard fallback otherwise.
 """
 
 from __future__ import annotations
@@ -11,6 +10,7 @@ import asyncio
 import json
 import logging
 import sqlite3
+import struct
 from pathlib import Path
 from typing import Any
 
@@ -36,7 +36,8 @@ CREATE TABLE IF NOT EXISTS beliefs (
     last_confirmed TEXT NOT NULL,
     last_retrieved TEXT,
     superseded_by TEXT,
-    tags TEXT DEFAULT '[]'
+    tags TEXT DEFAULT '[]',
+    embedding BLOB
 );
 
 CREATE INDEX IF NOT EXISTS idx_beliefs_capability ON beliefs(capability);
@@ -45,9 +46,11 @@ CREATE INDEX IF NOT EXISTS idx_beliefs_source ON beliefs(source);
 CREATE INDEX IF NOT EXISTS idx_beliefs_last_confirmed ON beliefs(last_confirmed);
 """
 
+_MIGRATION_ADD_EMBEDDING = "ALTER TABLE beliefs ADD COLUMN embedding BLOB"
+
 
 class SqliteMemoryBackend:
-    """Single-table SQLite storage for beliefs."""
+    """Single-table SQLite storage for beliefs with embedding support."""
 
     def __init__(self, db_path: str | Path):
         self.db_path = Path(db_path)
@@ -62,6 +65,15 @@ class SqliteMemoryBackend:
     def _init_db(self) -> None:
         self._conn.executescript(_SCHEMA)
         self._conn.commit()
+        # Migrate: add embedding column if missing
+        try:
+            self._conn.execute("SELECT embedding FROM beliefs LIMIT 0")
+        except sqlite3.OperationalError:
+            try:
+                self._conn.execute(_MIGRATION_ADD_EMBEDDING)
+                self._conn.commit()
+            except sqlite3.OperationalError:
+                pass
 
     def close(self) -> None:
         self._conn.close()
@@ -74,14 +86,27 @@ class SqliteMemoryBackend:
 
     # -- Write operations --------------------------------------------------
 
+    @staticmethod
+    def _encode_embedding(embedding: list[float] | None) -> bytes | None:
+        if embedding is None:
+            return None
+        return struct.pack(f"{len(embedding)}f", *embedding)
+
+    @staticmethod
+    def _decode_embedding(blob: bytes | None) -> list[float] | None:
+        if blob is None:
+            return None
+        count = len(blob) // 4
+        return list(struct.unpack(f"{count}f", blob))
+
     def _store_sync(self, belief: Belief) -> int:
         cursor = self._conn.execute(
             """INSERT INTO beliefs
                (capability, description, valence, confidence, confirmation_count,
                 entities, config, metric_name, metric_value, last_metric_value,
                 source, first_seen, last_confirmed, last_retrieved,
-                superseded_by, tags)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                superseded_by, tags, embedding)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 belief.capability,
                 belief.description,
@@ -99,6 +124,7 @@ class SqliteMemoryBackend:
                 belief.last_retrieved.isoformat() if belief.last_retrieved else None,
                 belief.superseded_by,
                 json.dumps(list(belief.tags)),
+                self._encode_embedding(belief.embedding),
             ),
         )
         self._conn.commit()
@@ -116,7 +142,7 @@ class SqliteMemoryBackend:
                 confirmation_count=?, entities=?, config=?,
                 metric_name=?, metric_value=?, last_metric_value=?,
                 source=?, first_seen=?, last_confirmed=?, last_retrieved=?,
-                superseded_by=?, tags=?
+                superseded_by=?, tags=?, embedding=?
                WHERE id=?""",
             (
                 belief.capability,
@@ -135,6 +161,7 @@ class SqliteMemoryBackend:
                 belief.last_retrieved.isoformat() if belief.last_retrieved else None,
                 belief.superseded_by,
                 json.dumps(list(belief.tags)),
+                self._encode_embedding(belief.embedding),
                 belief.id,
             ),
         )
@@ -157,15 +184,14 @@ class SqliteMemoryBackend:
     def _find_similar_sync(
         self,
         observation: Observation,
-        threshold: float = 0.85,
+        threshold: float = 0.75,
+        embedding: list[float] | None = None,
     ) -> Belief | None:
         """Find the belief most similar to this observation.
 
-        First checks for exact capability match, then ranks by
-        token-level Jaccard similarity on description.
+        Uses cosine similarity on embeddings when available,
+        falls back to Jaccard on description text.
         """
-        from ganglion.memory.similarity import jaccard_similarity
-
         rows = self._conn.execute(
             "SELECT * FROM beliefs WHERE capability = ? AND superseded_by IS NULL",
             (observation.capability,),
@@ -174,9 +200,24 @@ class SqliteMemoryBackend:
         best_match: Belief | None = None
         best_score = 0.0
 
+        if embedding is not None:
+            from ganglion.memory.similarity import cosine_similarity
+            for row in rows:
+                belief_embedding = self._decode_embedding(row["embedding"])
+                if belief_embedding is not None:
+                    score = cosine_similarity(embedding, belief_embedding)
+                    if score >= threshold and score > best_score:
+                        best_score = score
+                        best_match = self._row_to_belief(row)
+            if best_match is not None:
+                return best_match
+
+        # Fallback to Jaccard
+        from ganglion.memory.similarity import jaccard_similarity
+        jaccard_threshold = max(threshold, 0.85) if embedding is not None else threshold
         for row in rows:
             score = jaccard_similarity(observation.description, row["description"])
-            if score >= threshold and score > best_score:
+            if score >= jaccard_threshold and score > best_score:
                 best_score = score
                 best_match = self._row_to_belief(row)
 
@@ -185,9 +226,12 @@ class SqliteMemoryBackend:
     async def find_similar(
         self,
         observation: Observation,
-        threshold: float = 0.85,
+        threshold: float = 0.75,
+        embedding: list[float] | None = None,
     ) -> Belief | None:
-        return await asyncio.to_thread(self._find_similar_sync, observation, threshold)
+        return await asyncio.to_thread(
+            self._find_similar_sync, observation, threshold, embedding,
+        )
 
     def _query_sync(
         self,
@@ -254,14 +298,19 @@ class SqliteMemoryBackend:
 
     # -- Row mapping -------------------------------------------------------
 
-    @staticmethod
-    def _row_to_belief(row: sqlite3.Row) -> Belief:
+    def _row_to_belief(self, row: sqlite3.Row) -> Belief:
         from datetime import UTC, datetime
 
         def _parse_dt(val: Any) -> datetime:
             if isinstance(val, str):
                 return datetime.fromisoformat(val)
             return datetime.now(UTC)
+
+        embedding = None
+        try:
+            embedding = self._decode_embedding(row["embedding"])
+        except (KeyError, IndexError):
+            pass
 
         return Belief(
             id=row["id"],
@@ -281,4 +330,5 @@ class SqliteMemoryBackend:
             last_retrieved=_parse_dt(row["last_retrieved"]) if row["last_retrieved"] else None,
             superseded_by=row["superseded_by"],
             tags=tuple(json.loads(row["tags"] or "[]")),
+            embedding=embedding,
         )

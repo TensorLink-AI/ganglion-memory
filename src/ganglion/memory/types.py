@@ -88,6 +88,7 @@ class Belief:
     last_retrieved: datetime | None = None
     superseded_by: str | None = None
     tags: tuple[str, ...] = ()
+    embedding: list[float] | None = None
 
     @property
     def is_pattern(self) -> bool:
@@ -118,7 +119,7 @@ class Belief:
         return self.confidence * self.confirmation_count * recency_factor
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        d: dict[str, Any] = {
             "id": self.id,
             "capability": self.capability,
             "description": self.description,
@@ -137,6 +138,13 @@ class Belief:
             "superseded_by": self.superseded_by,
             "tags": list(self.tags),
         }
+        if self.embedding is not None:
+            import base64
+            import struct
+            d["embedding"] = base64.b64encode(
+                struct.pack(f"{len(self.embedding)}f", *self.embedding)
+            ).decode("ascii")
+        return d
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> Belief:
@@ -146,6 +154,14 @@ class Belief:
             if isinstance(val, datetime):
                 return val
             return datetime.now(UTC)
+
+        embedding = None
+        if data.get("embedding"):
+            import base64
+            import struct
+            raw = base64.b64decode(data["embedding"])
+            count = len(raw) // 4
+            embedding = list(struct.unpack(f"{count}f", raw))
 
         return cls(
             id=data.get("id"),
@@ -165,6 +181,7 @@ class Belief:
             last_retrieved=_parse_dt(data["last_retrieved"]) if data.get("last_retrieved") else None,
             superseded_by=data.get("superseded_by"),
             tags=tuple(data.get("tags", ())),
+            embedding=embedding,
         )
 
 
