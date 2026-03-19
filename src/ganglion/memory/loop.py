@@ -67,6 +67,12 @@ class MemoryLoop:
     # Metric shift detection
     metric_shift_threshold: float = 0.15
 
+    # Deprecated knobs — accepted for backward compatibility, ignored
+    inhibition_floor: float = 0.2
+    cross_agent_bonus: float = 2.0
+    exploration_rate: float = 0.0
+    crisis_multiplier: float = 3.0
+
     _pending_deltas: list[Delta] = field(default_factory=list)
     _delta_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     _contradiction_streak: int = 0
@@ -85,6 +91,25 @@ class MemoryLoop:
             logger.debug("Embedding failed: %s", e)
             return None
 
+    async def _find_similar(
+        self,
+        obs: Observation,
+        threshold: float = 0.75,
+        embedding: list[float] | None = None,
+    ) -> Belief | None:
+        """Call backend.find_similar with backward-compatible signature.
+
+        Old backends may not accept the `embedding` kwarg, so we fall
+        back to calling without it if we get a TypeError.
+        """
+        try:
+            return await self.backend.find_similar(
+                obs, threshold=threshold, embedding=embedding,
+            )
+        except TypeError:
+            # Old backend doesn't accept embedding param
+            return await self.backend.find_similar(obs, threshold=threshold)
+
     # ------------------------------------------------------------------
     # Write path: the single primitive
     # ------------------------------------------------------------------
@@ -98,7 +123,7 @@ class MemoryLoop:
         # Compute embedding for the observation
         obs_embedding = await self._embed(obs.description)
 
-        existing = await self.backend.find_similar(
+        existing = await self._find_similar(
             obs, threshold=0.75, embedding=obs_embedding,
         )
 
@@ -308,11 +333,11 @@ class MemoryLoop:
     async def context_for(
         self,
         capability: str,
-        query: str = "",
         entities: tuple[str, ...] = (),
         exclude_source: str | None = None,
         tags: tuple[str, ...] = (),
         max_entries: int = 10,
+        query: str = "",
     ) -> str:
         """Generate prompt-injectable context.
 

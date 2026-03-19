@@ -503,11 +503,19 @@ class TestNewImports:
         ]:
             assert hasattr(gm, name), f"{name} not exported from ganglion.memory"
 
-    def test_removed_features_not_on_loop(self):
-        """Removed knobs are not constructor params."""
+    def test_deprecated_knobs_accepted_but_ignored(self):
+        """Deprecated knobs are accepted for backward compat."""
         from ganglion.memory import MemoryLoop
-        import inspect
-        sig = inspect.signature(MemoryLoop)
-        params = set(sig.parameters.keys())
-        assert "exploration_rate" not in params
-        assert "cross_agent_bonus" not in params
+        from ganglion.memory.backends.json_file import JsonMemoryBackend
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            backend = JsonMemoryBackend(d)
+            # These should not raise
+            loop = MemoryLoop(
+                backend=backend,
+                exploration_rate=2.0,
+                cross_agent_bonus=1.0,
+                crisis_multiplier=5.0,
+                inhibition_floor=0.1,
+            )
+            assert loop is not None
