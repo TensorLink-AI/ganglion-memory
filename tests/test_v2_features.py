@@ -586,6 +586,65 @@ class TestCounterfactual:
         assert "response to: hello" in result
         assert call_count == 1
 
+    def test_clean_first_ordering(self, tmp_dir):
+        """Clean call happens before memory check — first call has no injection."""
+        calls = []
+
+        def agent(prompt: str) -> str:
+            calls.append(prompt)
+            return f"response to: {prompt}"
+
+        from ganglion.memory.wrap import memory
+        wrapped = memory(agent, capability="test", db_path=str(tmp_dir / "m.db"))
+
+        # First invocation: no memory, single call, clean prompt only
+        wrapped("hello")
+        assert len(calls) == 1
+        # The clean call should NOT have "What we know" injected
+        assert "What we know" not in calls[0]
+
+    def test_rollback_returns_clean_when_no_embedder(self, tmp_dir):
+        """Without embedder, comparison can't happen — falls through to LLM compare
+        which defaults to 'clean' when no LLM client is available."""
+        call_count = 0
+
+        def agent(prompt: str) -> str:
+            nonlocal call_count
+            call_count += 1
+            return f"response {call_count}: {prompt}"
+
+        from ganglion.memory.wrap import memory
+        wrapped = memory(agent, capability="test", db_path=str(tmp_dir / "m.db"))
+
+        # First call populates memory
+        result1 = wrapped("hello")
+        assert call_count == 1
+
+        # Second call: has context, runs clean + memory, no embedder so
+        # memory_changed_output stays True, _compare_outputs returns "clean"
+        # because no LLM client available → rollback to clean response
+        call_count = 0
+        result2 = wrapped("hello")
+        # 2 calls: clean first, then with memory
+        assert call_count == 2
+        # Should rollback to clean (response 1, the first call in this round)
+        assert "response 1:" in result2
+
+    def test_async_clean_first_ordering(self, tmp_dir):
+        """Async: clean call happens before memory check."""
+        import asyncio
+        calls = []
+
+        async def agent(prompt: str) -> str:
+            calls.append(prompt)
+            return f"response to: {prompt}"
+
+        from ganglion.memory.wrap import memory
+        wrapped = memory(agent, capability="test", db_path=str(tmp_dir / "m.db"))
+        asyncio.run(wrapped("hello"))
+        assert len(calls) == 1
+        assert "What we know" not in calls[0]
+
 
 # ======================================================================
 # Dependency tracking (Addition 2)
