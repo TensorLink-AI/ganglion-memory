@@ -90,6 +90,7 @@ class Belief:
     tags: tuple[str, ...] = ()
     embedding: list[float] | None = None
     produced_with: tuple[int, ...] = ()  # IDs of beliefs retrieved when this was created
+    input_context: str = ""  # the task/query that produced this belief
 
     @property
     def is_pattern(self) -> bool:
@@ -145,8 +146,8 @@ class Belief:
             d["embedding"] = base64.b64encode(
                 struct.pack(f"{len(self.embedding)}f", *self.embedding)
             ).decode("ascii")
-        if self.produced_with:
-            d["produced_with"] = list(self.produced_with)
+        d["produced_with"] = list(self.produced_with)
+        d["input_context"] = self.input_context
         return d
 
     @classmethod
@@ -186,6 +187,7 @@ class Belief:
             tags=tuple(data.get("tags", ())),
             embedding=embedding,
             produced_with=tuple(data.get("produced_with", ())),
+            input_context=data.get("input_context", ""),
         )
 
 

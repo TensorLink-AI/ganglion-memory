@@ -11,12 +11,34 @@ import json
 import logging
 import sqlite3
 import struct
+import math
+import re
 from pathlib import Path
 from typing import Any
 
 from ganglion.memory.types import Belief, Observation, Valence
 
 logger = logging.getLogger(__name__)
+
+
+def _cosine_similarity(a: list[float], b: list[float]) -> float:
+    if len(a) != len(b) or not a:
+        return 0.0
+    dot = sum(x * y for x, y in zip(a, b))
+    norm_a = math.sqrt(sum(x * x for x in a))
+    norm_b = math.sqrt(sum(x * x for x in b))
+    if norm_a == 0.0 or norm_b == 0.0:
+        return 0.0
+    return dot / (norm_a * norm_b)
+
+
+def _jaccard_similarity(a: str, b: str) -> float:
+    tokens_a = set(re.findall(r'[a-z0-9]+', a.lower()))
+    tokens_b = set(re.findall(r'[a-z0-9]+', b.lower()))
+    if not tokens_a or not tokens_b:
+        return 0.0
+    return len(tokens_a & tokens_b) / len(tokens_a | tokens_b)
+
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS beliefs (
@@ -38,7 +60,8 @@ CREATE TABLE IF NOT EXISTS beliefs (
     superseded_by TEXT,
     tags TEXT DEFAULT '[]',
     embedding BLOB,
-    produced_with TEXT DEFAULT '[]'
+    produced_with TEXT DEFAULT '[]',
+    input_context TEXT DEFAULT ''
 );
 
 CREATE INDEX IF NOT EXISTS idx_beliefs_capability ON beliefs(capability);
@@ -49,6 +72,7 @@ CREATE INDEX IF NOT EXISTS idx_beliefs_last_confirmed ON beliefs(last_confirmed)
 
 _MIGRATION_ADD_EMBEDDING = "ALTER TABLE beliefs ADD COLUMN embedding BLOB"
 _MIGRATION_ADD_PRODUCED_WITH = "ALTER TABLE beliefs ADD COLUMN produced_with TEXT DEFAULT '[]'"
+_MIGRATION_ADD_INPUT_CONTEXT = "ALTER TABLE beliefs ADD COLUMN input_context TEXT DEFAULT ''"
 
 
 class SqliteMemoryBackend:
@@ -76,12 +100,10 @@ class SqliteMemoryBackend:
                 self._conn.commit()
             except sqlite3.OperationalError:
                 pass
-        # Migrate: add produced_with column if missing
-        try:
-            self._conn.execute("SELECT produced_with FROM beliefs LIMIT 0")
-        except sqlite3.OperationalError:
+        # Migrate: add produced_with and input_context columns if missing
+        for migration in [_MIGRATION_ADD_PRODUCED_WITH, _MIGRATION_ADD_INPUT_CONTEXT]:
             try:
-                self._conn.execute(_MIGRATION_ADD_PRODUCED_WITH)
+                self._conn.execute(migration)
                 self._conn.commit()
             except sqlite3.OperationalError:
                 pass
@@ -116,8 +138,8 @@ class SqliteMemoryBackend:
                (capability, description, valence, confidence, confirmation_count,
                 entities, config, metric_name, metric_value, last_metric_value,
                 source, first_seen, last_confirmed, last_retrieved,
-                superseded_by, tags, embedding, produced_with)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                superseded_by, tags, embedding, produced_with, input_context)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 belief.capability,
                 belief.description,
@@ -137,6 +159,7 @@ class SqliteMemoryBackend:
                 json.dumps(list(belief.tags)),
                 self._encode_embedding(belief.embedding),
                 json.dumps(list(belief.produced_with)),
+                belief.input_context,
             ),
         )
         self._conn.commit()
@@ -154,7 +177,8 @@ class SqliteMemoryBackend:
                 confirmation_count=?, entities=?, config=?,
                 metric_name=?, metric_value=?, last_metric_value=?,
                 source=?, first_seen=?, last_confirmed=?, last_retrieved=?,
-                superseded_by=?, tags=?, embedding=?, produced_with=?
+                superseded_by=?, tags=?, embedding=?, produced_with=?,
+                input_context=?
                WHERE id=?""",
             (
                 belief.capability,
@@ -175,6 +199,7 @@ class SqliteMemoryBackend:
                 json.dumps(list(belief.tags)),
                 self._encode_embedding(belief.embedding),
                 json.dumps(list(belief.produced_with)),
+                belief.input_context,
                 belief.id,
             ),
         )
@@ -214,11 +239,10 @@ class SqliteMemoryBackend:
         best_score = 0.0
 
         if embedding is not None:
-            from ganglion.memory.similarity import cosine_similarity
             for row in rows:
                 belief_embedding = self._decode_embedding(row["embedding"])
                 if belief_embedding is not None:
-                    score = cosine_similarity(embedding, belief_embedding)
+                    score = _cosine_similarity(embedding, belief_embedding)
                     if score >= threshold and score > best_score:
                         best_score = score
                         best_match = self._row_to_belief(row)
@@ -226,10 +250,9 @@ class SqliteMemoryBackend:
                 return best_match
 
         # Fallback to Jaccard
-        from ganglion.memory.similarity import jaccard_similarity
         jaccard_threshold = max(threshold, 0.85) if embedding is not None else threshold
         for row in rows:
-            score = jaccard_similarity(observation.description, row["description"])
+            score = _jaccard_similarity(observation.description, row["description"])
             if score >= jaccard_threshold and score > best_score:
                 best_score = score
                 best_match = self._row_to_belief(row)
@@ -345,4 +368,5 @@ class SqliteMemoryBackend:
             tags=tuple(json.loads(row["tags"] or "[]")),
             embedding=embedding,
             produced_with=tuple(json.loads(row["produced_with"] or "[]")),
+            input_context=row["input_context"] or "",
         )

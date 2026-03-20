@@ -8,7 +8,8 @@ Everything else — strengthening, weakening, contradiction detection,
 entity profiling, eviction — happens inside that single call or
 on the read path.
 
-v2: Embedding-based similarity, query-aware context, simplified knobs.
+v3: Evo-Memory integration — structured retrieval, relevance gating,
+    dependency propagation, few-shot context formatting.
 """
 
 from __future__ import annotations
@@ -67,11 +68,8 @@ class MemoryLoop:
     # Metric shift detection
     metric_shift_threshold: float = 0.15
 
-    # Deprecated knobs — accepted for backward compatibility, ignored
-    inhibition_floor: float = 0.2
-    cross_agent_bonus: float = 2.0
-    exploration_rate: float = 0.0
-    crisis_multiplier: float = 3.0
+    # Relevance gate for retrieval (Evo-Memory)
+    relevance_threshold: float = 0.5
 
     _pending_deltas: list[Delta] = field(default_factory=list)
     _delta_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
@@ -134,10 +132,12 @@ class MemoryLoop:
         if existing is None:
             # Novel observation — compute salience for initial confidence
             confidence = await self._compute_salience(obs) if self.salience else 1.0
-            # Read dependency info from config
+            # Extract dependency chain and input context from config
             produced_with = ()
-            if obs.config and "produced_with" in obs.config:
-                produced_with = tuple(obs.config["produced_with"])
+            input_context = ""
+            if obs.config:
+                produced_with = tuple(obs.config.get("produced_with", ()))
+                input_context = obs.config.get("input_text", "")
             belief = Belief(
                 capability=obs.capability,
                 description=obs.description,
@@ -154,6 +154,7 @@ class MemoryLoop:
                 last_confirmed=obs.timestamp,
                 embedding=obs_embedding,
                 produced_with=produced_with,
+                input_context=input_context,
             )
             await self.backend.store(belief)
             return None
@@ -401,6 +402,91 @@ class MemoryLoop:
         beliefs = beliefs[:max_entries]
 
         return self._format_context(beliefs)
+
+    async def retrieve_for(
+        self,
+        capability: str,
+        entities: tuple[str, ...] = (),
+        exclude_source: str | None = None,
+        tags: tuple[str, ...] = (),
+        max_entries: int = 10,
+        query: str = "",
+    ) -> tuple[str, list[Belief]]:
+        """Retrieve beliefs and return both formatted context and the raw beliefs.
+
+        Uses relevance_threshold to gate injection. Returns ("", []) if
+        nothing clears the threshold.
+        """
+        beliefs = await self.backend.query(
+            capability=capability,
+            entities=entities,
+            exclude_source=exclude_source,
+            tags=tags,
+            limit=max_entries * 5,
+        )
+
+        if not beliefs:
+            return "", []
+
+        if query and self.embedder is not None:
+            query_embedding = await self._embed(query)
+            if query_embedding is not None:
+                scored = []
+                for b in beliefs:
+                    if b.embedding is not None:
+                        relevance = cosine_similarity(query_embedding, b.embedding)
+                    else:
+                        relevance = 0.0
+                    score = relevance * 0.7 + min(b.strength / 10.0, 1.0) * 0.3
+                    scored.append((b, score))
+                scored.sort(key=lambda x: x[1], reverse=True)
+                selected = [b for b, score in scored[:max_entries] if score > self.relevance_threshold]
+                if selected:
+                    return self._format_context_v3(selected, query), selected
+
+        beliefs.sort(key=lambda b: b.strength, reverse=True)
+        selected = beliefs[:max_entries]
+        return self._format_context_v3(selected), selected
+
+    def _format_context_v3(
+        self,
+        beliefs: list[Belief],
+        query: str = "",
+    ) -> str:
+        """Format beliefs as structured few-shot examples.
+
+        Evo-Memory finding: few-shot experience format outperforms rule lists.
+        """
+        if not beliefs:
+            return ""
+
+        lines: list[str] = ["## Relevant experience"]
+
+        for b in beliefs:
+            status = "✓" if b.is_pattern else "✗" if b.is_antipattern else "~"
+            conf = f" [confirmed {b.confirmation_count}x]" if b.confirmation_count > 1 else ""
+
+            # If we have the full experience tuple, format as few-shot
+            if b.config and b.config.get("input_text"):
+                lines.append(f"\n**Prior task**: {b.config['input_text'][:200]}")
+                if b.config.get("output_text"):
+                    lines.append(f"**Outcome**: {status} {b.config['output_text'][:150]}")
+                lines.append(f"**Lesson**: {b.description}{conf}")
+            elif b.input_context:
+                lines.append(f"\n**Prior task**: {b.input_context[:200]}")
+                lines.append(f"**Lesson**: {status} {b.description}{conf}")
+            else:
+                # Legacy belief without experience context
+                metric = f" ({b.metric_name}={b.metric_value})" if b.metric_value else ""
+                lines.append(f"- {status} {b.description}{metric}{conf}")
+
+        contradictions = self._find_contradictions(beliefs)
+        if contradictions:
+            lines.append("\n**Unresolved contradictions:**")
+            for a, b in contradictions:
+                lines.append(f"- '{a.description}' vs '{b.description}'")
+
+        return "\n".join(lines)
 
     def _format_context(
         self,

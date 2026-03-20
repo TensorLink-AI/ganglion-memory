@@ -9,8 +9,8 @@ That's it. The wrapper auto-detects call conventions (OpenAI messages,
 Anthropic system+messages, or plain string) and injects memory context
 before each call, then evaluates the response after.
 
-v2: Supports reflection modes ("auto", "simple", or callable),
-    query-aware context injection, and embeddings.
+v3: Counterfactual evaluation with rollback — runs with and without
+    memory, keeps the better output, trains beliefs from the comparison.
 """
 
 from __future__ import annotations
@@ -91,18 +91,7 @@ def _default_judge(response: Any) -> dict[str, Any]:
 
 def _extract_query(args: tuple, kwargs: dict) -> str:
     """Extract the user's query from call arguments for context retrieval."""
-    # OpenAI-style: messages kwarg with user messages
-    if "messages" in kwargs:
-        messages = kwargs["messages"]
-        if messages and isinstance(messages, list):
-            # Find the last user message
-            for msg in reversed(messages):
-                if isinstance(msg, dict) and msg.get("role") == "user":
-                    content = msg.get("content", "")
-                    if isinstance(content, str):
-                        return content[:500]
-
-    # Anthropic-style: messages kwarg
+    # OpenAI/Anthropic-style: messages kwarg with user messages
     if "messages" in kwargs:
         messages = kwargs["messages"]
         if messages and isinstance(messages, list):
@@ -162,6 +151,91 @@ def _inject_context(args: tuple, kwargs: dict, context: str) -> tuple[tuple, dic
 
 
 # ------------------------------------------------------------------
+# Counterfactual evaluation
+# ------------------------------------------------------------------
+
+async def _evaluate_counterfactual(
+    query: str,
+    response_clean: Any,
+    response_mem: Any,
+    memory_loop: MemoryLoop,
+    model: str,
+) -> str:
+    """Compare with-memory and without-memory outputs.
+
+    Returns: "memory" | "clean" | "same"
+    """
+    # First: quick embedding check — are outputs meaningfully different?
+    if memory_loop.embedder:
+        emb_clean = await memory_loop._embed(str(response_clean)[:500])
+        emb_mem = await memory_loop._embed(str(response_mem)[:500])
+        if emb_clean and emb_mem:
+            similarity = cosine_similarity(emb_clean, emb_mem)
+            if similarity > 0.95:
+                return "same"  # outputs nearly identical, memory did nothing
+
+    # Outputs differ — ask LLM which is better
+    clean_text = str(response_clean)[:1500]
+    mem_text = str(response_mem)[:1500]
+
+    prompt = f"""Compare two responses to the same task. One had no prior context (A), the other had prior experience injected (B).
+
+TASK: {query[:1000]}
+
+RESPONSE A (no context):
+{clean_text}
+
+RESPONSE B (with experience):
+{mem_text}
+
+Which response demonstrates better reasoning and is more likely correct?
+Answer ONLY with the single letter "A" or "B"."""
+
+    try:
+        client = _get_comparison_client()
+        if client is None:
+            return "same"  # Can't compare — conservative, treat as no difference
+
+        if hasattr(client, "messages"):
+            resp = await client.messages.create(
+                model=model, max_tokens=5,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            answer = resp.content[0].text.strip().upper()
+        elif hasattr(client, "chat"):
+            resp = await client.chat.completions.create(
+                model=model, max_tokens=5,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            answer = resp.choices[0].message.content.strip().upper()
+        else:
+            return "same"
+
+        if "B" in answer:
+            return "memory"
+        elif "A" in answer:
+            return "clean"
+        return "same"
+    except Exception:
+        return "same"
+
+
+def _get_comparison_client() -> Any:
+    """Get an async LLM client for counterfactual comparison."""
+    try:
+        import anthropic
+        return anthropic.AsyncAnthropic()
+    except (ImportError, Exception):
+        pass
+    try:
+        import openai
+        return openai.AsyncOpenAI()
+    except (ImportError, Exception):
+        pass
+    return None
+
+
+# ------------------------------------------------------------------
 # The wrapper
 # ------------------------------------------------------------------
 
@@ -187,9 +261,8 @@ def memory(
         agent = memory(agent, capability="mining", bot_id="alpha")
 
     Args:
-        reflection: "auto" (LLM-based), "simple" (heuristic default),
-                    or a callable for custom evaluation.
-        reflect_model: Model to use for LLM reflection (when reflection="auto").
+        reflection: "simple" (heuristic default) or a callable for custom evaluation.
+        reflect_model: Model to use for counterfactual LLM comparison.
         embedder: Optional Embedder instance for semantic similarity.
     """
     # Support @memory without parens (fn is the decorated function)
@@ -209,79 +282,64 @@ def memory(
     agent = MemoryAgent(memory=mem, capability=capability, bot_id=bot_id)
 
     # Determine the judge function
-    if judge is not None:
-        judge_fn = judge
-    elif reflection == "auto":
-        judge_fn = None  # Will use reflection
-    else:
-        judge_fn = _default_judge
+    judge_fn = judge if judge is not None else _default_judge
+
+    def _judge(resp):
+        return judge_fn(resp)
 
     if inspect.iscoroutinefunction(fn):
         @functools.wraps(fn)
         async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
             query = _extract_query(args, kwargs)
+            original_args, original_kwargs = args, kwargs
 
-            # Phase 1: always run WITHOUT memory first
+            # Phase 1: run WITHOUT memory
             response_clean = await fn(*args, **kwargs)
 
             # Phase 2: check if memory has anything relevant
             context = await agent.remember(query=query)
 
             if not context:
-                # No relevant memory — use clean response, learn from it
-                result = (judge_fn or _default_judge)(response_clean)
+                # No relevant memory — learn from clean response, return it
+                result = _judge(response_clean)
                 if query and "description" in result:
                     result["description"] = f"{result['description'][:250]} [task: {query[:200]}]"
                 await agent.learn(result, input_text=query, output_text=str(response_clean)[:2000])
                 return response_clean
 
             # Phase 3: run WITH memory
-            mem_args, mem_kwargs = _inject_context(args, kwargs, context)
+            mem_args, mem_kwargs = _inject_context(original_args, original_kwargs, context)
             response_mem = await fn(*mem_args, **mem_kwargs)
 
-            # Phase 4: compare — did memory help?
-            emb_clean = await mem._embed(str(response_clean)[:500]) if mem.embedder else None
-            emb_mem = await mem._embed(str(response_mem)[:500]) if mem.embedder else None
+            # Phase 4: compare outputs
+            memory_helped = await _evaluate_counterfactual(
+                query, response_clean, response_mem, mem, reflect_model,
+            )
 
-            memory_changed_output = True
-            if emb_clean and emb_mem:
-                similarity = cosine_similarity(emb_clean, emb_mem)
-                memory_changed_output = similarity < 0.9  # outputs meaningfully differ
-
-            if not memory_changed_output:
-                # Memory made no difference — weaken retrieved beliefs, use clean response
-                for belief in agent._retrieved_beliefs:
-                    if belief.id is not None:
-                        belief.confidence = max(0.1, belief.confidence - 0.05)
-                        await mem.backend.update(belief)
-                agent._retrieved_beliefs = []
-                result = (judge_fn or _default_judge)(response_clean)
-                if query and "description" in result:
-                    result["description"] = f"{result['description'][:250]} [task: {query[:200]}]"
-                await agent.learn(result, input_text=query, output_text=str(response_clean)[:2000])
-                return response_clean
-
-            # Memory changed the output. Which is better?
-            better = await _compare_outputs(query, response_clean, response_mem, mem, reflect_model)
-
-            if better == "memory":
-                # Memory helped — strengthen retrieved beliefs, return memory response
+            if memory_helped == "memory":
+                # Memory improved the output — strengthen retrieved beliefs
                 for belief in agent._retrieved_beliefs:
                     if belief.id is not None:
                         belief.confidence = min(10.0, belief.confidence + 0.1)
                         belief.last_retrieved = datetime.now(UTC)
                         await mem.backend.update(belief)
                 response = response_mem
+            elif memory_helped == "same":
+                # Memory made no difference — mildly weaken (it's wasting context)
+                for belief in agent._retrieved_beliefs:
+                    if belief.id is not None:
+                        belief.confidence = max(0.1, belief.confidence - 0.05)
+                        await mem.backend.update(belief)
+                response = response_clean
             else:
-                # Memory hurt — weaken retrieved beliefs, ROLLBACK to clean response
+                # Memory hurt — rollback, weaken aggressively
                 for belief in agent._retrieved_beliefs:
                     if belief.id is not None:
                         belief.confidence = max(0.1, belief.confidence - 0.15)
                         await mem.backend.update(belief)
                 response = response_clean
 
-            agent._retrieved_beliefs = []
-            result = (judge_fn or _default_judge)(response)
+            result = _judge(response)
             if query and "description" in result:
                 result["description"] = f"{result['description'][:250]} [task: {query[:200]}]"
             await agent.learn(result, input_text=query, output_text=str(response)[:2000])
@@ -293,15 +351,16 @@ def memory(
         def sync_wrapper(*args: Any, **kwargs: Any) -> Any:
             loop = _get_event_loop()
             query = _extract_query(args, kwargs)
+            original_args, original_kwargs = args, kwargs
 
-            # Phase 1: always run WITHOUT memory first
+            # Phase 1: run WITHOUT memory
             response_clean = fn(*args, **kwargs)
 
             # Phase 2: check if memory has anything relevant
             context = loop.run_until_complete(agent.remember(query=query))
 
             if not context:
-                result = (judge_fn or _default_judge)(response_clean)
+                result = _judge(response_clean)
                 if query and "description" in result:
                     result["description"] = f"{result['description'][:250]} [task: {query[:200]}]"
                 loop.run_until_complete(
@@ -310,44 +369,29 @@ def memory(
                 return response_clean
 
             # Phase 3: run WITH memory
-            mem_args, mem_kwargs = _inject_context(args, kwargs, context)
+            mem_args, mem_kwargs = _inject_context(original_args, original_kwargs, context)
             response_mem = fn(*mem_args, **mem_kwargs)
 
-            # Phase 4: compare — did memory help?
-            emb_clean = loop.run_until_complete(mem._embed(str(response_clean)[:500])) if mem.embedder else None
-            emb_mem = loop.run_until_complete(mem._embed(str(response_mem)[:500])) if mem.embedder else None
-
-            memory_changed_output = True
-            if emb_clean and emb_mem:
-                similarity = cosine_similarity(emb_clean, emb_mem)
-                memory_changed_output = similarity < 0.9
-
-            if not memory_changed_output:
-                for belief in agent._retrieved_beliefs:
-                    if belief.id is not None:
-                        belief.confidence = max(0.1, belief.confidence - 0.05)
-                        loop.run_until_complete(mem.backend.update(belief))
-                agent._retrieved_beliefs = []
-                result = (judge_fn or _default_judge)(response_clean)
-                if query and "description" in result:
-                    result["description"] = f"{result['description'][:250]} [task: {query[:200]}]"
-                loop.run_until_complete(
-                    agent.learn(result, input_text=query, output_text=str(response_clean)[:2000])
+            # Phase 4: compare outputs
+            memory_helped = loop.run_until_complete(
+                _evaluate_counterfactual(
+                    query, response_clean, response_mem, mem, reflect_model,
                 )
-                return response_clean
-
-            # Memory changed output — which is better?
-            better = loop.run_until_complete(
-                _compare_outputs(query, response_clean, response_mem, mem, reflect_model)
             )
 
-            if better == "memory":
+            if memory_helped == "memory":
                 for belief in agent._retrieved_beliefs:
                     if belief.id is not None:
                         belief.confidence = min(10.0, belief.confidence + 0.1)
                         belief.last_retrieved = datetime.now(UTC)
                         loop.run_until_complete(mem.backend.update(belief))
                 response = response_mem
+            elif memory_helped == "same":
+                for belief in agent._retrieved_beliefs:
+                    if belief.id is not None:
+                        belief.confidence = max(0.1, belief.confidence - 0.05)
+                        loop.run_until_complete(mem.backend.update(belief))
+                response = response_clean
             else:
                 for belief in agent._retrieved_beliefs:
                     if belief.id is not None:
@@ -355,8 +399,7 @@ def memory(
                         loop.run_until_complete(mem.backend.update(belief))
                 response = response_clean
 
-            agent._retrieved_beliefs = []
-            result = (judge_fn or _default_judge)(response)
+            result = _judge(response)
             if query and "description" in result:
                 result["description"] = f"{result['description'][:250]} [task: {query[:200]}]"
             loop.run_until_complete(
@@ -365,107 +408,6 @@ def memory(
             return response
 
         return sync_wrapper
-
-
-async def _reflect_response(
-    input_text: str,
-    response: Any,
-    memory_loop: MemoryLoop,
-    capability: str,
-    model: str,
-) -> dict[str, Any]:
-    """Use LLM reflection to evaluate a response."""
-    try:
-        from ganglion.memory.reflect import reflect
-        output_text = str(response)[:2000]
-        beliefs = await memory_loop.backend.query(capability=capability, limit=20)
-        obs = await reflect(
-            input_text=input_text,
-            output_text=output_text,
-            existing_beliefs=beliefs,
-            capability=capability,
-            model=model,
-        )
-        return {
-            "success": obs.valence == Valence.POSITIVE,
-            "description": obs.description,
-            "entities": list(obs.entities),
-            "tags": list(obs.tags),
-        }
-    except Exception as e:
-        logger.warning("LLM reflection failed, using default judge: %s", e)
-        return _default_judge(response)
-
-
-async def _compare_outputs(
-    query: str,
-    response_clean: Any,
-    response_mem: Any,
-    memory_loop: MemoryLoop,
-    model: str,
-) -> str:
-    """Ask an LLM which output is better. Returns 'memory' or 'clean'."""
-    clean_text = str(response_clean)[:1500]
-    mem_text = str(response_mem)[:1500]
-
-    prompt = f"""You are comparing two responses to the same task.
-
-One was produced with no prior context. The other had prior experience injected.
-
-TASK: {query[:1000]}
-
-RESPONSE A:
-{clean_text}
-
-RESPONSE B:
-{mem_text}
-
-Which response is more thorough, accurate, and well-reasoned?
-Answer ONLY "A" or "B". Nothing else."""
-
-    try:
-        client = _get_llm_client()
-        if client is None:
-            return "clean"  # Can't judge — default to clean (conservative)
-
-        if hasattr(client, "messages"):
-            result = await client.messages.create(
-                model=model, max_tokens=5,
-                messages=[{"role": "user", "content": prompt}],
-            )
-            answer = result.content[0].text.strip().upper()
-        elif hasattr(client, "chat"):
-            result = await client.chat.completions.create(
-                model=model, max_tokens=5,
-                messages=[{"role": "user", "content": prompt}],
-            )
-            answer = result.choices[0].message.content.strip().upper()
-        else:
-            return "clean"
-
-        # A = clean, B = memory
-        return "memory" if answer == "B" else "clean"
-    except Exception:
-        return "clean"  # On failure, conservative — don't trust memory
-
-
-def _get_llm_client() -> Any:
-    """Get an async LLM client for comparison."""
-    try:
-        import anthropic
-        return anthropic.AsyncAnthropic()
-    except (ImportError, Exception):
-        pass
-    try:
-        import openai
-        return openai.AsyncOpenAI()
-    except (ImportError, Exception):
-        pass
-    return None
-
-
-# Avoid circular import at module level
-from ganglion.memory.types import Valence  # noqa: E402
 
 
 def _get_event_loop() -> asyncio.AbstractEventLoop:
