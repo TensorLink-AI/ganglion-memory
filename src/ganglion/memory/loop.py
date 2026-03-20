@@ -134,6 +134,10 @@ class MemoryLoop:
         if existing is None:
             # Novel observation — compute salience for initial confidence
             confidence = await self._compute_salience(obs) if self.salience else 1.0
+            # Read dependency info from config
+            produced_with = ()
+            if obs.config and "produced_with" in obs.config:
+                produced_with = tuple(obs.config["produced_with"])
             belief = Belief(
                 capability=obs.capability,
                 description=obs.description,
@@ -149,6 +153,7 @@ class MemoryLoop:
                 first_seen=obs.timestamp,
                 last_confirmed=obs.timestamp,
                 embedding=obs_embedding,
+                produced_with=produced_with,
             )
             await self.backend.store(belief)
             return None
@@ -225,6 +230,9 @@ class MemoryLoop:
                 last_confirmed=obs.timestamp,
                 embedding=obs_embedding,
             ))
+            # Weaken anything built on this contradicted belief
+            if existing.id is not None:
+                await self._weaken_dependents(existing.id)
         else:
             await self.backend.update(existing)
 
@@ -318,6 +326,19 @@ class MemoryLoop:
             inhibited += 1
 
         return inhibited
+
+    async def _weaken_dependents(self, belief_id: int, depth: int = 0) -> None:
+        """When a belief is contradicted, weaken beliefs that were produced with it."""
+        if depth > 3:  # prevent infinite recursion
+            return
+        all_beliefs = await self.backend.all_beliefs()
+        for b in all_beliefs:
+            if belief_id in b.produced_with:
+                b.confidence = max(self.death_threshold, b.confidence - self.weaken_rate * 0.5)
+                await self.backend.update(b)
+                # Recurse — dependents of dependents are also suspect
+                if b.id is not None:
+                    await self._weaken_dependents(b.id, depth + 1)
 
     async def drain_deltas(self) -> list[Delta]:
         """Collect and clear pending deltas."""

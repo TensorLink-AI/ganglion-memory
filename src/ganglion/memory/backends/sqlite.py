@@ -37,7 +37,8 @@ CREATE TABLE IF NOT EXISTS beliefs (
     last_retrieved TEXT,
     superseded_by TEXT,
     tags TEXT DEFAULT '[]',
-    embedding BLOB
+    embedding BLOB,
+    produced_with TEXT DEFAULT '[]'
 );
 
 CREATE INDEX IF NOT EXISTS idx_beliefs_capability ON beliefs(capability);
@@ -47,6 +48,7 @@ CREATE INDEX IF NOT EXISTS idx_beliefs_last_confirmed ON beliefs(last_confirmed)
 """
 
 _MIGRATION_ADD_EMBEDDING = "ALTER TABLE beliefs ADD COLUMN embedding BLOB"
+_MIGRATION_ADD_PRODUCED_WITH = "ALTER TABLE beliefs ADD COLUMN produced_with TEXT DEFAULT '[]'"
 
 
 class SqliteMemoryBackend:
@@ -71,6 +73,15 @@ class SqliteMemoryBackend:
         except sqlite3.OperationalError:
             try:
                 self._conn.execute(_MIGRATION_ADD_EMBEDDING)
+                self._conn.commit()
+            except sqlite3.OperationalError:
+                pass
+        # Migrate: add produced_with column if missing
+        try:
+            self._conn.execute("SELECT produced_with FROM beliefs LIMIT 0")
+        except sqlite3.OperationalError:
+            try:
+                self._conn.execute(_MIGRATION_ADD_PRODUCED_WITH)
                 self._conn.commit()
             except sqlite3.OperationalError:
                 pass
@@ -105,8 +116,8 @@ class SqliteMemoryBackend:
                (capability, description, valence, confidence, confirmation_count,
                 entities, config, metric_name, metric_value, last_metric_value,
                 source, first_seen, last_confirmed, last_retrieved,
-                superseded_by, tags, embedding)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                superseded_by, tags, embedding, produced_with)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 belief.capability,
                 belief.description,
@@ -125,6 +136,7 @@ class SqliteMemoryBackend:
                 belief.superseded_by,
                 json.dumps(list(belief.tags)),
                 self._encode_embedding(belief.embedding),
+                json.dumps(list(belief.produced_with)),
             ),
         )
         self._conn.commit()
@@ -142,7 +154,7 @@ class SqliteMemoryBackend:
                 confirmation_count=?, entities=?, config=?,
                 metric_name=?, metric_value=?, last_metric_value=?,
                 source=?, first_seen=?, last_confirmed=?, last_retrieved=?,
-                superseded_by=?, tags=?, embedding=?
+                superseded_by=?, tags=?, embedding=?, produced_with=?
                WHERE id=?""",
             (
                 belief.capability,
@@ -162,6 +174,7 @@ class SqliteMemoryBackend:
                 belief.superseded_by,
                 json.dumps(list(belief.tags)),
                 self._encode_embedding(belief.embedding),
+                json.dumps(list(belief.produced_with)),
                 belief.id,
             ),
         )
@@ -331,4 +344,5 @@ class SqliteMemoryBackend:
             superseded_by=row["superseded_by"],
             tags=tuple(json.loads(row["tags"] or "[]")),
             embedding=embedding,
+            produced_with=tuple(json.loads(row["produced_with"] or "[]")),
         )

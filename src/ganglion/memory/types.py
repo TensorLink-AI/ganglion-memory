@@ -89,6 +89,7 @@ class Belief:
     superseded_by: str | None = None
     tags: tuple[str, ...] = ()
     embedding: list[float] | None = None
+    produced_with: tuple[int, ...] = ()  # IDs of beliefs retrieved when this was created
 
     @property
     def is_pattern(self) -> bool:
@@ -144,6 +145,8 @@ class Belief:
             d["embedding"] = base64.b64encode(
                 struct.pack(f"{len(self.embedding)}f", *self.embedding)
             ).decode("ascii")
+        if self.produced_with:
+            d["produced_with"] = list(self.produced_with)
         return d
 
     @classmethod
@@ -182,6 +185,7 @@ class Belief:
             superseded_by=data.get("superseded_by"),
             tags=tuple(data.get("tags", ())),
             embedding=embedding,
+            produced_with=tuple(data.get("produced_with", ())),
         )
 
 

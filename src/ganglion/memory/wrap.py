@@ -23,6 +23,7 @@ from typing import Any, Callable
 
 from ganglion.memory.agent import MemoryAgent
 from ganglion.memory.backends.sqlite import SqliteMemoryBackend
+from ganglion.memory.embed import cosine_similarity
 from ganglion.memory.loop import MemoryLoop
 
 logger = logging.getLogger(__name__)
@@ -220,12 +221,40 @@ def memory(
             # Extract query for context retrieval
             query = _extract_query(args, kwargs)
 
-            # Inject memory context
-            context = await agent.remember(query=query)
-            args, kwargs = _inject_context(args, kwargs, context)
+            # Save originals before injection
+            original_args = args
+            original_kwargs = kwargs
 
-            # Call the original
-            response = await fn(*args, **kwargs)
+            # Call WITH memory
+            context = await agent.remember(query=query)
+            if context:
+                mem_args, mem_kwargs = _inject_context(args, kwargs, context)
+                response_with = await fn(*mem_args, **mem_kwargs)
+
+                # Call WITHOUT memory (same task, clean) — counterfactual
+                response_without = await fn(*original_args, **original_kwargs)
+
+                # Compare: did memory change the output?
+                if agent._retrieved_beliefs and agent.memory.embedder:
+                    emb_with = await agent.memory._embed(str(response_with)[:500])
+                    emb_without = await agent.memory._embed(str(response_without)[:500])
+                    if emb_with and emb_without:
+                        divergence = 1.0 - cosine_similarity(emb_with, emb_without)
+                        for belief in agent._retrieved_beliefs:
+                            if belief.id is None:
+                                continue
+                            if divergence > 0.3:
+                                # Memory changed the output — it's load-bearing
+                                belief.confidence = min(10.0, belief.confidence + 0.05)
+                            else:
+                                # Memory made no difference — it's noise
+                                belief.confidence = max(0.1, belief.confidence - 0.05)
+                            await agent.memory.backend.update(belief)
+
+                response = response_with
+            else:
+                # No memory retrieved — just run normally
+                response = await fn(*original_args, **original_kwargs)
 
             # Judge and learn
             if judge_fn is not None:
@@ -258,12 +287,44 @@ def memory(
             # Extract query for context retrieval
             query = _extract_query(args, kwargs)
 
-            # Inject memory context
-            context = loop.run_until_complete(agent.remember(query=query))
-            args, kwargs = _inject_context(args, kwargs, context)
+            # Save originals before injection
+            original_args = args
+            original_kwargs = kwargs
 
-            # Call the original
-            response = fn(*args, **kwargs)
+            # Call WITH memory
+            context = loop.run_until_complete(agent.remember(query=query))
+            if context:
+                mem_args, mem_kwargs = _inject_context(args, kwargs, context)
+                response_with = fn(*mem_args, **mem_kwargs)
+
+                # Call WITHOUT memory (same task, clean) — counterfactual
+                response_without = fn(*original_args, **original_kwargs)
+
+                # Compare: did memory change the output?
+                if agent._retrieved_beliefs and agent.memory.embedder:
+                    emb_with = loop.run_until_complete(
+                        agent.memory._embed(str(response_with)[:500])
+                    )
+                    emb_without = loop.run_until_complete(
+                        agent.memory._embed(str(response_without)[:500])
+                    )
+                    if emb_with and emb_without:
+                        divergence = 1.0 - cosine_similarity(emb_with, emb_without)
+                        for belief in agent._retrieved_beliefs:
+                            if belief.id is None:
+                                continue
+                            if divergence > 0.3:
+                                belief.confidence = min(10.0, belief.confidence + 0.05)
+                            else:
+                                belief.confidence = max(0.1, belief.confidence - 0.05)
+                            loop.run_until_complete(
+                                agent.memory.backend.update(belief)
+                            )
+
+                response = response_with
+            else:
+                # No memory retrieved — just run normally
+                response = fn(*original_args, **original_kwargs)
 
             # Judge and learn
             if judge_fn is not None:

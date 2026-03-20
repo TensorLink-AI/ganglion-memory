@@ -95,6 +95,15 @@ class MemoryAgent:
     run_id: str | None = None
     context_limit: int = 10
     include_foreign: bool = True
+    _retrieved_beliefs: list = None  # type: ignore[assignment]
+    _task_count: int = 0
+    synthesis_interval: int = 10
+    synthesis_model: str = "claude-haiku"
+    _llm_client: Any = None
+
+    def __post_init__(self):
+        if self._retrieved_beliefs is None:
+            self._retrieved_beliefs = []
 
     async def remember(self, query: str = "") -> str:
         """BEFORE acting. Build prompt context from memory.
@@ -102,9 +111,19 @@ class MemoryAgent:
         When query is provided, retrieves beliefs relevant to the
         current input rather than just top-N by strength.
         """
+        self._retrieved_beliefs = []
         parts: list[str] = []
 
         # Own knowledge
+        own_beliefs = await self.memory.backend.query(
+            capability=self.capability,
+            entities=self.entities,
+            tags=self.tags,
+            limit=self.context_limit * 5,
+        )
+        if own_beliefs:
+            self._retrieved_beliefs.extend(own_beliefs)
+
         own = await self.memory.context_for(
             capability=self.capability,
             query=query,
@@ -160,7 +179,50 @@ class MemoryAgent:
             entities=self.entities,
             tags=self.tags,
         )
-        return await self.memory.assimilate(obs)
+
+        # Stamp which beliefs were active when this observation was produced
+        if self._retrieved_beliefs:
+            retrieved_ids = tuple(b.id for b in self._retrieved_beliefs if b.id is not None)
+            if retrieved_ids:
+                config = dict(obs.config) if obs.config else {}
+                config["produced_with"] = list(retrieved_ids)
+                obs = Observation(
+                    capability=obs.capability,
+                    description=obs.description,
+                    valence=obs.valence,
+                    entities=obs.entities,
+                    config=config,
+                    metric_name=obs.metric_name,
+                    metric_value=obs.metric_value,
+                    source=obs.source,
+                    run_id=obs.run_id,
+                    tags=obs.tags,
+                    timestamp=obs.timestamp,
+                )
+
+        delta = await self.memory.assimilate(obs)
+
+        # Continuous synthesis: every N tasks, compress recent experiences
+        self._task_count += 1
+        if self._task_count % self.synthesis_interval == 0 and self._llm_client:
+            try:
+                from ganglion.memory.synthesize import synthesize
+                recent = await self.memory.backend.query(
+                    capability=self.capability, limit=30,
+                )
+                insights = await synthesize(
+                    beliefs=recent,
+                    model=self.synthesis_model,
+                    llm_client=self._llm_client,
+                    capability=self.capability,
+                )
+                for insight_obs in insights:
+                    await self.memory.assimilate(insight_obs)
+            except Exception as e:
+                logger.warning("Continuous synthesis failed: %s", e)
+
+        self._retrieved_beliefs = []
+        return delta
 
 
 # ------------------------------------------------------------------

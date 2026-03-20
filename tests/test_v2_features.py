@@ -519,3 +519,314 @@ class TestNewImports:
                 inhibition_floor=0.1,
             )
             assert loop is not None
+
+
+# ======================================================================
+# Counterfactual evaluation (Addition 1)
+# ======================================================================
+
+class TestCounterfactual:
+    @pytest.fixture(autouse=True)
+    def reset_singleton(self):
+        import ganglion.memory.wrap as mod
+        mod._default_memory = None
+        yield
+        mod._default_memory = None
+
+    def test_no_context_single_call(self, tmp_dir):
+        """When no memory context exists, only one LLM call happens."""
+        call_count = 0
+
+        def agent(prompt: str) -> str:
+            nonlocal call_count
+            call_count += 1
+            return f"response to: {prompt}"
+
+        from ganglion.memory.wrap import memory
+        wrapped = memory(agent, capability="test", db_path=str(tmp_dir / "m.db"))
+        result = wrapped("hello")
+        assert "response to: hello" in result
+        # First call: no memory, so only 1 call
+        assert call_count == 1
+
+    def test_with_context_two_calls(self, tmp_dir):
+        """When memory context exists, two LLM calls happen (with and without)."""
+        call_count = 0
+
+        def agent(prompt: str) -> str:
+            nonlocal call_count
+            call_count += 1
+            return f"response {call_count}"
+
+        from ganglion.memory.wrap import memory
+        wrapped = memory(agent, capability="test", db_path=str(tmp_dir / "m.db"))
+
+        # First call populates memory
+        wrapped("hello")
+        first_round_calls = call_count
+
+        # Second call should have context and make 2 calls
+        call_count = 0
+        wrapped("hello")
+        assert call_count == 2  # with memory + without memory
+
+    def test_async_no_context_single_call(self, tmp_dir):
+        """Async: when no memory context, only one call happens."""
+        import asyncio
+        call_count = 0
+
+        async def agent(prompt: str) -> str:
+            nonlocal call_count
+            call_count += 1
+            return f"response to: {prompt}"
+
+        from ganglion.memory.wrap import memory
+        wrapped = memory(agent, capability="test", db_path=str(tmp_dir / "m.db"))
+        result = asyncio.run(wrapped("hello"))
+        assert "response to: hello" in result
+        assert call_count == 1
+
+
+# ======================================================================
+# Dependency tracking (Addition 2)
+# ======================================================================
+
+@pytest.mark.asyncio
+class TestDependencyTracking:
+    async def test_produced_with_field_roundtrip(self):
+        """produced_with survives to_dict/from_dict roundtrip."""
+        b = Belief(
+            id=1, capability="test", description="child",
+            valence=Valence.POSITIVE, produced_with=(10, 20, 30),
+        )
+        d = b.to_dict()
+        assert d["produced_with"] == [10, 20, 30]
+        b2 = Belief.from_dict(d)
+        assert b2.produced_with == (10, 20, 30)
+
+    async def test_produced_with_empty_by_default(self):
+        """Beliefs without produced_with default to empty tuple."""
+        b = Belief(capability="test", description="standalone")
+        assert b.produced_with == ()
+        d = b.to_dict()
+        assert "produced_with" not in d  # empty tuples not serialized
+
+    async def test_produced_with_stored_in_sqlite(self, tmp_dir):
+        """SQLite backend preserves produced_with."""
+        backend = SqliteMemoryBackend(tmp_dir / "dep.db")
+        b = Belief(
+            capability="test", description="child belief",
+            valence=Valence.POSITIVE, produced_with=(5, 10),
+        )
+        await backend.store(b)
+        beliefs = await backend.all_beliefs()
+        assert beliefs[0].produced_with == (5, 10)
+        backend.close()
+
+    async def test_produced_with_stored_in_json(self, tmp_dir):
+        """JSON backend preserves produced_with."""
+        backend = JsonMemoryBackend(tmp_dir / "dep_json")
+        b = Belief(
+            capability="test", description="child belief",
+            valence=Valence.POSITIVE, produced_with=(5, 10),
+        )
+        await backend.store(b)
+        beliefs = await backend.all_beliefs()
+        assert beliefs[0].produced_with == (5, 10)
+
+    async def test_weaken_dependents_on_contradiction(self, tmp_dir):
+        """When a parent belief dies, its dependents get weakened."""
+        backend = SqliteMemoryBackend(tmp_dir / "dep2.db")
+        loop = MemoryLoop(backend=backend, weaken_rate=0.5)
+
+        # Create parent belief
+        parent = Belief(
+            capability="test", description="parent approach",
+            valence=Valence.POSITIVE, confidence=1.0,
+        )
+        await backend.store(parent)
+        parent_id = parent.id
+
+        # Create child belief that was produced with parent
+        child = Belief(
+            capability="test", description="child conclusion",
+            valence=Valence.POSITIVE, confidence=1.0,
+            produced_with=(parent_id,),
+        )
+        await backend.store(child)
+
+        # Contradict the parent until it dies
+        neg = Observation(
+            capability="test", description="parent approach",
+            valence=Valence.NEGATIVE,
+        )
+        await loop.assimilate(neg)  # confidence: 1.0 - 0.5 = 0.5
+        await loop.assimilate(neg)  # confidence: 0.5 - 0.5 = 0.0 → death
+
+        # Child should be weakened
+        beliefs = await backend.all_beliefs()
+        child_after = next(b for b in beliefs if b.description == "child conclusion")
+        assert child_after.confidence < 1.0
+        backend.close()
+
+    async def test_weaken_dependents_recursive(self, tmp_dir):
+        """Dependency weakening propagates through chains."""
+        backend = SqliteMemoryBackend(tmp_dir / "dep3.db")
+        loop = MemoryLoop(backend=backend, weaken_rate=0.5)
+
+        # Create chain: grandparent -> parent -> child
+        grandparent = Belief(
+            capability="test", description="grandparent idea",
+            valence=Valence.POSITIVE, confidence=1.0,
+        )
+        await backend.store(grandparent)
+
+        parent = Belief(
+            capability="test", description="parent idea",
+            valence=Valence.POSITIVE, confidence=1.0,
+            produced_with=(grandparent.id,),
+        )
+        await backend.store(parent)
+
+        child = Belief(
+            capability="test", description="child idea",
+            valence=Valence.POSITIVE, confidence=1.0,
+            produced_with=(parent.id,),
+        )
+        await backend.store(child)
+
+        # Kill grandparent
+        neg = Observation(
+            capability="test", description="grandparent idea",
+            valence=Valence.NEGATIVE,
+        )
+        await loop.assimilate(neg)
+        await loop.assimilate(neg)
+
+        beliefs = await backend.all_beliefs()
+        parent_after = next(b for b in beliefs if b.description == "parent idea")
+        child_after = next(b for b in beliefs if b.description == "child idea")
+        assert parent_after.confidence < 1.0
+        assert child_after.confidence < 1.0
+        backend.close()
+
+    async def test_agent_stamps_dependencies(self, tmp_dir):
+        """MemoryAgent.learn() stamps produced_with from _retrieved_beliefs."""
+        from ganglion.memory.agent import MemoryAgent
+        backend = SqliteMemoryBackend(tmp_dir / "dep4.db")
+        loop = MemoryLoop(backend=backend)
+
+        # Seed a belief
+        seed = Belief(
+            capability="test", description="seed knowledge",
+            valence=Valence.POSITIVE,
+        )
+        await backend.store(seed)
+
+        agent = MemoryAgent(memory=loop, capability="test")
+        # Simulate remembering
+        await agent.remember()
+
+        # Learn something new — should stamp the seed's id
+        await agent.learn({
+            "success": True,
+            "description": "new conclusion based on seed",
+        })
+
+        beliefs = await backend.all_beliefs()
+        new_belief = next(
+            (b for b in beliefs if "new conclusion" in b.description), None
+        )
+        assert new_belief is not None
+        assert seed.id in new_belief.produced_with
+        backend.close()
+
+
+# ======================================================================
+# Continuous synthesis (Addition 3)
+# ======================================================================
+
+@pytest.mark.asyncio
+class TestContinuousSynthesis:
+    async def test_synthesis_triggers_at_interval(self, tmp_dir):
+        """After synthesis_interval tasks, synthesized beliefs appear."""
+        from ganglion.memory.agent import MemoryAgent
+        backend = SqliteMemoryBackend(tmp_dir / "synth.db")
+        loop = MemoryLoop(backend=backend)
+
+        # Simple mock LLM client that returns empty synthesis
+        synthesis_called = False
+
+        async def mock_llm(prompt: str) -> str:
+            nonlocal synthesis_called
+            synthesis_called = True
+            return "[]"
+
+        agent = MemoryAgent(
+            memory=loop, capability="test",
+            synthesis_interval=3,
+            _llm_client=mock_llm,
+        )
+
+        # Learn 2 tasks — no synthesis yet
+        for i in range(2):
+            await agent.learn({"success": True, "description": f"task {i}"})
+        assert not synthesis_called
+
+        # 3rd task triggers synthesis
+        await agent.learn({"success": True, "description": "task 2"})
+        assert synthesis_called
+        backend.close()
+
+    async def test_synthesis_not_triggered_without_client(self, tmp_dir):
+        """Without llm_client, synthesis doesn't run."""
+        from ganglion.memory.agent import MemoryAgent
+        backend = SqliteMemoryBackend(tmp_dir / "synth2.db")
+        loop = MemoryLoop(backend=backend)
+
+        agent = MemoryAgent(
+            memory=loop, capability="test",
+            synthesis_interval=1,
+            _llm_client=None,
+        )
+
+        # Should not raise
+        await agent.learn({"success": True, "description": "task"})
+        beliefs = await backend.all_beliefs()
+        # Only the learned belief, no synthesized ones
+        assert all("synthesized" not in b.tags for b in beliefs)
+        backend.close()
+
+    async def test_synthesis_stores_insights(self, tmp_dir):
+        """When synthesis returns observations, they get stored."""
+        from ganglion.memory.agent import MemoryAgent
+        backend = SqliteMemoryBackend(tmp_dir / "synth3.db")
+        loop = MemoryLoop(backend=backend)
+
+        # Mock LLM that returns a synthesized insight
+        async def mock_llm(prompt: str) -> str:
+            return '[{"valence": "positive", "description": "lr<0.01 always works", "entities": ["lr"], "tags": ["synthesized"]}]'
+
+        agent = MemoryAgent(
+            memory=loop, capability="test",
+            synthesis_interval=2,
+            _llm_client=mock_llm,
+        )
+
+        # Seed with distinct beliefs so synthesis has material (>= 2 beliefs needed)
+        await agent.learn({
+            "success": True,
+            "description": "small learning rate 0.001 gives stable convergence",
+            "entities": ["lr"],
+        })
+        await agent.learn({
+            "success": False,
+            "description": "large batch size 256 causes out of memory errors",
+            "entities": ["batch_size"],
+        })
+
+        beliefs = await backend.all_beliefs()
+        synthesized = [b for b in beliefs if "synthesized" in b.tags]
+        assert len(synthesized) >= 1
+        assert any("lr" in b.description.lower() for b in synthesized)
+        backend.close()
