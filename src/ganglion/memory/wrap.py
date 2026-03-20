@@ -246,7 +246,6 @@ def memory(
     bot_id: str | None = None,
     db_path: str = "memory.db",
     judge: Callable | None = None,
-    reflection: str = "simple",
     reflect_model: str = "claude-haiku",
     embedder: Any = None,
 ) -> Any:
@@ -261,7 +260,6 @@ def memory(
         agent = memory(agent, capability="mining", bot_id="alpha")
 
     Args:
-        reflection: "simple" (heuristic default) or a callable for custom evaluation.
         reflect_model: Model to use for counterfactual LLM comparison.
         embedder: Optional Embedder instance for semantic similarity.
     """
@@ -270,7 +268,7 @@ def memory(
         def decorator(f: Callable) -> Callable:
             return memory(
                 f, capability=capability, bot_id=bot_id, db_path=db_path,
-                judge=judge, reflection=reflection, reflect_model=reflect_model,
+                judge=judge, reflect_model=reflect_model,
                 embedder=embedder,
             )
         return decorator
