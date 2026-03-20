@@ -1,5 +1,5 @@
 """Tests for v2/v3 features: embedding-based similarity, query-aware context,
-structured reflection, counterfactual evaluation, and dependency tracking.
+counterfactual evaluation, and dependency tracking.
 """
 
 import tempfile
@@ -10,7 +10,6 @@ import pytest
 from ganglion.memory.backends.sqlite import SqliteMemoryBackend
 from ganglion.memory.embed import CallableEmbedder
 from ganglion.memory.loop import MemoryLoop
-from ganglion.memory.reflect import _simple_reflect
 from ganglion.memory.types import Belief, Observation, Valence
 from ganglion.memory.wrap import _default_judge, _extract_query
 
@@ -208,51 +207,6 @@ class TestQueryAwareContext:
 
         ctx = await loop.context_for("x", max_entries=1)
         assert "strong belief" in ctx
-
-
-# ======================================================================
-# Simple reflection (structured experience storage)
-# ======================================================================
-
-class TestSimpleReflect:
-    def test_error_detection(self):
-        obs = _simple_reflect(
-            "do something", "Error: connection failed",
-            "test", None,
-        )
-        assert obs.valence == Valence.NEGATIVE
-        assert "failed" in obs.description.lower()
-
-    def test_success_detection(self):
-        obs = _simple_reflect(
-            "do something", "Here is the result you requested with detailed analysis",
-            "test", None,
-        )
-        assert obs.valence == Valence.POSITIVE
-
-    def test_minimal_response_neutral(self):
-        obs = _simple_reflect(
-            "do something", "ok",
-            "test", None,
-        )
-        assert obs.valence == Valence.NEUTRAL
-
-    def test_stores_experience_tuple(self):
-        """_simple_reflect stores input/output in config for few-shot retrieval."""
-        obs = _simple_reflect(
-            "solve x^2 = 4", "x = 2 or x = -2",
-            "math", None,
-        )
-        assert obs.config is not None
-        assert obs.config["input_text"] == "solve x^2 = 4"
-        assert obs.config["output_text"] == "x = 2 or x = -2"
-
-    def test_truncates_long_input(self):
-        obs = _simple_reflect(
-            "x" * 1000, "short response",
-            "test", None,
-        )
-        assert len(obs.config["input_text"]) <= 500
 
 
 # ======================================================================
