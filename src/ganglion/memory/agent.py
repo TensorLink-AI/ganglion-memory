@@ -5,7 +5,7 @@ Three touch points, any agent, any task:
 
     1. BEFORE acting  -> remember(query=...) -> inject context into prompt
     2. AFTER acting    -> learn(result, input_text=..., output_text=...) -> feed outcome
-    3. BETWEEN runs   -> between_runs() -> synthesize + forget
+    3. BETWEEN runs   -> between_runs() -> drain + forget
 
 The agent itself doesn't know about memory. It receives a richer
 prompt and reports what happened. That's it.
@@ -14,7 +14,7 @@ prompt and reports what happened. That's it.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from ganglion.memory.loop import MemoryLoop
@@ -95,48 +95,26 @@ class MemoryAgent:
     run_id: str | None = None
     context_limit: int = 10
     include_foreign: bool = True
-    _retrieved_beliefs: list = None  # type: ignore[assignment]
-    _task_count: int = 0
-    synthesis_interval: int = 10
-    synthesis_model: str = "claude-haiku"
-    _llm_client: Any = None
-
-    def __post_init__(self):
-        if self._retrieved_beliefs is None:
-            self._retrieved_beliefs = []
+    _retrieved_beliefs: list = field(default_factory=list)
 
     async def remember(self, query: str = "") -> str:
-        """BEFORE acting. Build prompt context from memory.
-
-        When query is provided, retrieves beliefs relevant to the
-        current input rather than just top-N by strength.
-        """
-        self._retrieved_beliefs = []
+        """BEFORE acting. Build prompt context and track what was retrieved."""
         parts: list[str] = []
+        self._retrieved_beliefs = []
 
-        # Own knowledge
-        own_beliefs = await self.memory.backend.query(
-            capability=self.capability,
-            entities=self.entities,
-            tags=self.tags,
-            limit=self.context_limit * 5,
-        )
-        if own_beliefs:
-            self._retrieved_beliefs.extend(own_beliefs)
-
-        own = await self.memory.context_for(
+        own_context, own_beliefs = await self.memory.retrieve_for(
             capability=self.capability,
             query=query,
             entities=self.entities,
             tags=self.tags,
             max_entries=self.context_limit,
         )
-        if own:
-            parts.append(own)
+        if own_context:
+            parts.append(own_context)
+            self._retrieved_beliefs.extend(own_beliefs)
 
-        # Foreign knowledge
         if self.include_foreign and self.bot_id:
-            foreign = await self.memory.context_for(
+            foreign_context, foreign_beliefs = await self.memory.retrieve_for(
                 capability=self.capability,
                 query=query,
                 entities=self.entities,
@@ -144,14 +122,14 @@ class MemoryAgent:
                 exclude_source=self.bot_id,
                 max_entries=self.context_limit // 2,
             )
-            if foreign:
-                foreign = foreign.replace(
-                    "## What we know",
+            if foreign_context:
+                foreign_context = foreign_context.replace(
+                    "## Relevant experience",
                     "## What other agents report (unvalidated)",
                 )
-                parts.append(foreign)
+                parts.append(foreign_context)
+                self._retrieved_beliefs.extend(foreign_beliefs)
 
-        # Entity profiles
         for entity in self.entities:
             profile = await self.memory.entity_profile(entity)
             if not profile.startswith("No knowledge"):
@@ -165,12 +143,7 @@ class MemoryAgent:
         input_text: str = "",
         output_text: str = "",
     ) -> Delta | None:
-        """AFTER acting. Feed the outcome into memory.
-
-        When input_text and output_text are provided and reflection is
-        configured, uses LLM-based reflection instead of simple result
-        parsing.
-        """
+        """AFTER acting. Store experience with dependency tracking."""
         obs = result_to_observation(
             capability=self.capability,
             result=result,
@@ -180,47 +153,32 @@ class MemoryAgent:
             tags=self.tags,
         )
 
-        # Stamp which beliefs were active when this observation was produced
-        if self._retrieved_beliefs:
-            retrieved_ids = tuple(b.id for b in self._retrieved_beliefs if b.id is not None)
-            if retrieved_ids:
-                config = dict(obs.config) if obs.config else {}
-                config["produced_with"] = list(retrieved_ids)
-                obs = Observation(
-                    capability=obs.capability,
-                    description=obs.description,
-                    valence=obs.valence,
-                    entities=obs.entities,
-                    config=config,
-                    metric_name=obs.metric_name,
-                    metric_value=obs.metric_value,
-                    source=obs.source,
-                    run_id=obs.run_id,
-                    tags=obs.tags,
-                    timestamp=obs.timestamp,
-                )
+        # Stamp dependency chain: which beliefs were active when this was produced
+        retrieved_ids = tuple(b.id for b in self._retrieved_beliefs if b.id is not None)
+        config = dict(obs.config) if obs.config else {}
+        if retrieved_ids:
+            config["produced_with"] = list(retrieved_ids)
+        if input_text:
+            config["input_text"] = input_text[:500]
+        if output_text:
+            config["output_text"] = output_text[:500]
+
+        # Rebuild observation with enriched config (Observation is frozen)
+        obs = Observation(
+            capability=obs.capability,
+            description=obs.description,
+            valence=obs.valence,
+            entities=obs.entities,
+            config=config,
+            metric_name=obs.metric_name,
+            metric_value=obs.metric_value,
+            source=obs.source,
+            run_id=obs.run_id,
+            tags=obs.tags,
+            timestamp=obs.timestamp,
+        )
 
         delta = await self.memory.assimilate(obs)
-
-        # Continuous synthesis: every N tasks, compress recent experiences
-        self._task_count += 1
-        if self._task_count % self.synthesis_interval == 0 and self._llm_client:
-            try:
-                from ganglion.memory.synthesize import synthesize
-                recent = await self.memory.backend.query(
-                    capability=self.capability, limit=30,
-                )
-                insights = await synthesize(
-                    beliefs=recent,
-                    model=self.synthesis_model,
-                    llm_client=self._llm_client,
-                    capability=self.capability,
-                )
-                for insight_obs in insights:
-                    await self.memory.assimilate(insight_obs)
-            except Exception as e:
-                logger.warning("Continuous synthesis failed: %s", e)
-
         self._retrieved_beliefs = []
         return delta
 
@@ -229,41 +187,13 @@ class MemoryAgent:
 # Run boundary helper
 # ------------------------------------------------------------------
 
-async def between_runs(
-    memory: MemoryLoop,
-    llm_client: Any = None,
-    model: str = "claude-haiku",
-) -> list[Delta]:
-    """BETWEEN runs. Synthesize insights, drain deltas, forget weak beliefs.
-
-    With an LLM client: reasons over accumulated beliefs to produce
-    meta-insights before forgetting.
-    Without: just drains deltas and forgets (same as before).
-    """
+async def between_runs(memory: MemoryLoop) -> list[Delta]:
+    """BETWEEN runs. Drain deltas and forget weak beliefs."""
     deltas = await memory.drain_deltas()
     if deltas:
         logger.info("Memory shifts this run: %d", len(deltas))
         for d in deltas:
             logger.info("  %s", d.summary)
-
-    # Synthesis: reason over beliefs to produce meta-insights
-    if llm_client is not None:
-        try:
-            from ganglion.memory.synthesize import synthesize
-            recent_beliefs = await memory.backend.query(limit=50)
-            observations = await synthesize(
-                beliefs=recent_beliefs,
-                deltas=deltas,
-                model=model,
-                llm_client=llm_client,
-                capability=recent_beliefs[0].capability if recent_beliefs else "general",
-            )
-            for obs in observations:
-                await memory.assimilate(obs)
-            if observations:
-                logger.info("Synthesized %d meta-insights", len(observations))
-        except Exception as e:
-            logger.warning("Synthesis failed: %s", e)
 
     forgotten = await memory.forget()
     if forgotten:
