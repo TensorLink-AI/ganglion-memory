@@ -101,15 +101,17 @@ def _simple_reflect(
     error_signals = ["error", "failed", "exception", "traceback", "refused", "cannot", "unable"]
     has_error = any(sig in output_lower for sig in error_signals)
 
+    task_summary = input_text[:200]
+
     if has_error:
         valence = Valence.NEGATIVE
-        description = f"Failed: {output_text[:200]}"
+        description = f"Task failed: {task_summary}"
     elif len(output_text.strip()) < 10:
         valence = Valence.NEUTRAL
-        description = f"Minimal response to: {input_text[:200]}"
+        description = f"Inconclusive: {task_summary}"
     else:
         valence = Valence.POSITIVE
-        description = f"Succeeded: {output_text[:200]}"
+        description = f"Task succeeded: {task_summary}"
 
     return Observation(
         capability=capability,

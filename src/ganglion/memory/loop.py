@@ -371,7 +371,7 @@ class MemoryLoop:
                     scored.append((b, score))
                 scored.sort(key=lambda x: x[1], reverse=True)
                 # Filter by minimum relevance
-                beliefs = [b for b, score in scored[:max_entries] if score > 0.1]
+                beliefs = [b for b, score in scored[:max_entries] if score > 0.4]
                 if beliefs:
                     return self._format_context(beliefs, query)
 

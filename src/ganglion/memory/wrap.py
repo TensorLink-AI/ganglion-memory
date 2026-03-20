@@ -230,12 +230,16 @@ def memory(
             # Judge and learn
             if judge_fn is not None:
                 result = judge_fn(response)
+                if query and "description" in result:
+                    result["description"] = f"{result['description'][:250]} [task: {query[:200]}]"
             elif reflection == "auto":
                 result = await _reflect_response(
                     query, response, mem, capability, reflect_model,
                 )
             else:
                 result = _default_judge(response)
+                if query and "description" in result:
+                    result["description"] = f"{result['description'][:250]} [task: {query[:200]}]"
 
             await agent.learn(
                 result,
@@ -264,8 +268,12 @@ def memory(
             # Judge and learn
             if judge_fn is not None:
                 result = judge_fn(response)
+                if query and "description" in result:
+                    result["description"] = f"{result['description'][:250]} [task: {query[:200]}]"
             else:
                 result = _default_judge(response)
+                if query and "description" in result:
+                    result["description"] = f"{result['description'][:250]} [task: {query[:200]}]"
 
             loop.run_until_complete(agent.learn(
                 result,

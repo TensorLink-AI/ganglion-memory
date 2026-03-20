@@ -261,7 +261,7 @@ class TestSimpleReflect:
             "test", None,
         )
         assert obs.valence == Valence.NEGATIVE
-        assert "Failed" in obs.description
+        assert "failed" in obs.description.lower()
 
     def test_success_detection(self):
         obs = _simple_reflect(
