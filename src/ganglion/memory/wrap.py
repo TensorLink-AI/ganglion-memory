@@ -220,9 +220,10 @@ def memory(
             # Extract query for context retrieval
             query = _extract_query(args, kwargs)
 
-            # Inject memory context
-            context = await agent.remember(query=query)
-            args, kwargs = _inject_context(args, kwargs, context)
+            # GATE: only inject if memory is relevant
+            if await agent.should_inject(query):
+                context = await agent.remember(query=query)
+                args, kwargs = _inject_context(args, kwargs, context)
 
             # Call the original
             response = await fn(*args, **kwargs)
@@ -254,9 +255,10 @@ def memory(
             # Extract query for context retrieval
             query = _extract_query(args, kwargs)
 
-            # Inject memory context
-            context = loop.run_until_complete(agent.remember(query=query))
-            args, kwargs = _inject_context(args, kwargs, context)
+            # GATE: only inject if memory is relevant
+            if loop.run_until_complete(agent.should_inject(query)):
+                context = loop.run_until_complete(agent.remember(query=query))
+                args, kwargs = _inject_context(args, kwargs, context)
 
             # Call the original
             response = fn(*args, **kwargs)

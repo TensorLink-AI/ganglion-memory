@@ -14,7 +14,7 @@ import json
 import logging
 from typing import Any
 
-from ganglion.memory.types import Belief, Observation, Valence
+from ganglion.memory.types import Belief, Experience, Observation, Valence
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +42,30 @@ Rules:
 - entities should capture the key variables that matter
 - If the outcome is ambiguous, use "neutral"
 - Keep description under 200 characters"""
+
+REFLECT_PROMPT_V2 = """You are extracting a reusable lesson from an AI agent interaction.
+
+TASK INPUT:
+{input_text}
+
+AGENT OUTPUT:
+{output_text}
+
+OUTCOME: {outcome}
+
+Extract a lesson that would help solve SIMILAR future tasks. Output ONLY valid JSON:
+{{
+    "lesson": "<a generalizable strategy or principle, NOT the specific answer>",
+    "strategy_tags": ["<reasoning patterns used, e.g. 'elimination', 'decomposition'>"],
+    "input_summary": "<1-sentence description of the task type>",
+    "output_summary": "<1-sentence description of what the agent did>"
+}}
+
+Rules:
+- The lesson should be TRANSFERABLE — useful for similar but different problems
+- BAD lesson: "The answer to 2x^2-5x+1=0 is x=2.28 or x=0.22"
+- GOOD lesson: "For quadratic equations, apply the quadratic formula directly rather than trying to factor first when coefficients are non-trivial"
+- strategy_tags should capture the REASONING PATTERN, not the topic"""
 
 
 async def reflect(
@@ -116,6 +140,92 @@ def _simple_reflect(
         description=description[:500],
         valence=valence,
         source=source,
+    )
+
+
+async def reflect_experience(
+    input_text: str,
+    output_text: str,
+    success: bool,
+    capability: str = "general",
+    model: str = "claude-haiku",
+    llm_client: Any = None,
+) -> Experience:
+    """Extract a structured Experience from an interaction.
+
+    Uses the v2 reflection prompt to produce transferable lessons
+    in the Evo-Memory ExpRAG format.
+    Falls back to simple heuristics without an LLM.
+    """
+    if llm_client is None:
+        llm_client = _get_default_client()
+
+    if llm_client is None:
+        return _simple_experience(input_text, output_text, success, capability)
+
+    outcome = "SUCCESS" if success else "FAILURE"
+    prompt = REFLECT_PROMPT_V2.format(
+        input_text=input_text[:2000],
+        output_text=output_text[:2000],
+        outcome=outcome,
+    )
+
+    try:
+        result = await _call_llm(llm_client, prompt, model)
+        return _parse_experience(result, input_text, output_text, success, capability)
+    except Exception as e:
+        logger.warning("LLM experience reflection failed, falling back: %s", e)
+        return _simple_experience(input_text, output_text, success, capability)
+
+
+def _simple_experience(
+    input_text: str,
+    output_text: str,
+    success: bool,
+    capability: str,
+) -> Experience:
+    """Fallback: create a basic Experience without an LLM."""
+    if success:
+        lesson = f"Approach succeeded for: {input_text[:150]}"
+    else:
+        lesson = f"Approach failed for: {input_text[:150]}"
+
+    return Experience(
+        input_summary=input_text[:200],
+        output_summary=output_text[:200],
+        success=success,
+        lesson=lesson[:300],
+        capability=capability,
+    )
+
+
+def _parse_experience(
+    llm_output: str,
+    input_text: str,
+    output_text: str,
+    success: bool,
+    capability: str,
+) -> Experience:
+    """Parse the LLM's JSON response into an Experience."""
+    text = llm_output.strip()
+    if "```" in text:
+        start = text.find("{")
+        end = text.rfind("}") + 1
+        if start >= 0 and end > start:
+            text = text[start:end]
+
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return _simple_experience(input_text, output_text, success, capability)
+
+    return Experience(
+        input_summary=data.get("input_summary", input_text[:200])[:200],
+        output_summary=data.get("output_summary", output_text[:200])[:200],
+        success=success,
+        lesson=data.get("lesson", "")[:300],
+        strategy_tags=tuple(data.get("strategy_tags", ())),
+        capability=capability,
     )
 
 

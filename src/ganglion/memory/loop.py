@@ -120,8 +120,11 @@ class MemoryLoop:
         The ONLY write path into memory. Returns a Delta if something
         meaningful changed, None otherwise.
         """
-        # Compute embedding for the observation
-        obs_embedding = await self._embed(obs.description)
+        # Embed on task input when available, fall back to description
+        embed_text = obs.description
+        if obs.config and obs.config.get("input_text"):
+            embed_text = obs.config["input_text"]
+        obs_embedding = await self._embed(embed_text)
 
         existing = await self._find_similar(
             obs, threshold=0.75, embedding=obs_embedding,
@@ -204,7 +207,30 @@ class MemoryLoop:
         if self._contradiction_streak >= 3:
             effective_weaken *= 3.0
 
-        existing.confidence -= effective_weaken
+        # Contradiction-driven learning: create a conditional belief
+        # that captures WHEN each approach works/fails
+        conditional_description = (
+            f"CONDITIONAL: '{existing.description}' "
+            f"({'works' if existing.is_pattern else 'fails'}) but "
+            f"'{obs.description}' suggests "
+            f"{'failure' if existing.is_pattern else 'success'} "
+            f"in context [{', '.join(obs.tags[:5])}]"
+        )
+        conditional = Belief(
+            capability=obs.capability,
+            description=conditional_description[:500],
+            valence=Valence.NEUTRAL,
+            confidence=1.5,  # Higher initial confidence — contradictions are valuable
+            entities=_stable_merge(existing.entities, obs.entities),
+            tags=("contradiction_insight", "synthesized") + obs_tags,
+            embedding=obs_embedding,
+            first_seen=obs.timestamp,
+            last_confirmed=obs.timestamp,
+        )
+        await self.backend.store(conditional)
+
+        # Still weaken existing, but at half rate (preserve information longer)
+        existing.confidence -= effective_weaken * 0.5
 
         if existing.confidence <= self.death_threshold:
             existing.superseded_by = obs.description
@@ -386,34 +412,60 @@ class MemoryLoop:
         beliefs: list[Belief],
         query: str = "",
     ) -> str:
-        """Format beliefs as structured context."""
+        """Format beliefs as structured few-shot examples.
+
+        Uses experience-style formatting when beliefs have input context,
+        falls back to categorized format for legacy beliefs.
+        """
         if not beliefs:
             return ""
 
-        patterns = [b for b in beliefs if b.is_pattern]
-        antipatterns = [b for b in beliefs if b.is_antipattern]
-        neutral = [b for b in beliefs if b.valence == Valence.NEUTRAL]
+        lines: list[str] = ["## Relevant experience from similar tasks"]
 
-        lines: list[str] = ["## What we know"]
+        # Check if any beliefs have experience-style data
+        has_experiences = any(
+            b.config and b.config.get("input_text")
+            for b in beliefs
+        )
 
-        if patterns:
-            lines.append("\n### What works")
-            for b in patterns:
-                metric = f" ({b.metric_name}={b.metric_value})" if b.metric_value else ""
-                conf = f" [confirmed {b.confirmation_count}x]" if b.confirmation_count > 1 else ""
-                lines.append(f"- {b.description}{metric}{conf}")
+        if has_experiences:
+            for b in beliefs:
+                if b.config and b.config.get("input_text"):
+                    status = "Succeeded" if b.is_pattern else "Failed" if b.is_antipattern else "Observed"
+                    conf = f" [{b.confirmation_count}x]" if b.confirmation_count > 1 else ""
+                    lines.append(f"\n**Similar task**: {b.config['input_text'][:150]}")
+                    lines.append(f"**Outcome**: {status}{conf}")
+                    lines.append(f"**Lesson**: {b.description}")
+                else:
+                    # Legacy belief without input context
+                    prefix = "+" if b.is_pattern else "-" if b.is_antipattern else "~"
+                    metric = f" ({b.metric_name}={b.metric_value})" if b.metric_value else ""
+                    lines.append(f"{prefix} {b.description}{metric}")
+        else:
+            # Legacy format: categorized by valence
+            lines[0] = "## What we know"
+            patterns = [b for b in beliefs if b.is_pattern]
+            antipatterns = [b for b in beliefs if b.is_antipattern]
+            neutral = [b for b in beliefs if b.valence == Valence.NEUTRAL]
 
-        if antipatterns:
-            lines.append("\n### What fails")
-            for b in antipatterns:
-                conf = f" [confirmed {b.confirmation_count}x]" if b.confirmation_count > 1 else ""
-                lines.append(f"- {b.description}{conf}")
+            if patterns:
+                lines.append("\n### What works")
+                for b in patterns:
+                    metric = f" ({b.metric_name}={b.metric_value})" if b.metric_value else ""
+                    conf = f" [confirmed {b.confirmation_count}x]" if b.confirmation_count > 1 else ""
+                    lines.append(f"- {b.description}{metric}{conf}")
 
-        if neutral:
-            lines.append("\n### Observations")
-            for b in neutral:
-                conf = f" [confirmed {b.confirmation_count}x]" if b.confirmation_count > 1 else ""
-                lines.append(f"- {b.description}{conf}")
+            if antipatterns:
+                lines.append("\n### What fails")
+                for b in antipatterns:
+                    conf = f" [confirmed {b.confirmation_count}x]" if b.confirmation_count > 1 else ""
+                    lines.append(f"- {b.description}{conf}")
+
+            if neutral:
+                lines.append("\n### Observations")
+                for b in neutral:
+                    conf = f" [confirmed {b.confirmation_count}x]" if b.confirmation_count > 1 else ""
+                    lines.append(f"- {b.description}{conf}")
 
         # Flag contradictions
         contradictions = self._find_contradictions(beliefs)

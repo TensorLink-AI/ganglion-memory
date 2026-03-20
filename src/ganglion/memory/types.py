@@ -186,6 +186,72 @@ class Belief:
 
 
 @dataclass(frozen=True, slots=True)
+class Experience:
+    """A structured task experience for retrieval and reuse.
+
+    Maps to Evo-Memory's ExpRAG format: <input, output, feedback>
+    plus a distilled lesson for reuse. Embedded on the INPUT
+    (not the lesson) so retrieval finds structurally similar tasks.
+    """
+
+    input_summary: str
+    output_summary: str
+    success: bool
+    lesson: str
+    strategy_tags: tuple[str, ...] = ()
+    capability: str = ""
+    timestamp: datetime = field(default_factory=lambda: datetime.now(UTC))
+    embedding: list[float] | None = None  # Embedded on input_summary
+
+    def to_dict(self) -> dict[str, Any]:
+        d: dict[str, Any] = {
+            "input_summary": self.input_summary,
+            "output_summary": self.output_summary,
+            "success": self.success,
+            "lesson": self.lesson,
+            "strategy_tags": list(self.strategy_tags),
+            "capability": self.capability,
+            "timestamp": self.timestamp.isoformat(),
+        }
+        if self.embedding is not None:
+            import base64
+            import struct
+            d["embedding"] = base64.b64encode(
+                struct.pack(f"{len(self.embedding)}f", *self.embedding)
+            ).decode("ascii")
+        return d
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> Experience:
+        embedding = None
+        if data.get("embedding"):
+            import base64
+            import struct
+            raw = base64.b64decode(data["embedding"])
+            count = len(raw) // 4
+            embedding = list(struct.unpack(f"{count}f", raw))
+
+        ts = data.get("timestamp")
+        if isinstance(ts, str):
+            timestamp = datetime.fromisoformat(ts)
+        elif isinstance(ts, datetime):
+            timestamp = ts
+        else:
+            timestamp = datetime.now(UTC)
+
+        return cls(
+            input_summary=data.get("input_summary", ""),
+            output_summary=data.get("output_summary", ""),
+            success=data.get("success", True),
+            lesson=data.get("lesson", ""),
+            strategy_tags=tuple(data.get("strategy_tags", ())),
+            capability=data.get("capability", ""),
+            timestamp=timestamp,
+            embedding=embedding,
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class Delta:
     """Emitted when the system detects a meaningful change.
 

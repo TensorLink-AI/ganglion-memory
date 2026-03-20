@@ -419,18 +419,23 @@ class TestMemoryLoop:
         assert delta.delta_type == "contradiction"
 
     async def test_contradiction_kills_weak_belief(self, loop):
-        """Repeated contradiction causes apoptosis."""
-        loop.weaken_rate = 0.5  # aggressive weakening
+        """Repeated contradiction causes apoptosis.
+
+        With contradiction-driven learning, weakening is halved (0.5x)
+        so it takes more contradictions to kill a belief, but crisis
+        mode (3+ consecutive) still accelerates the process.
+        """
+        loop.weaken_rate = 1.0  # aggressive weakening (halved internally to 0.5)
 
         pos = Observation(capability="mining", description="batch=64", valence=Valence.POSITIVE)
         neg = Observation(capability="mining", description="batch=64", valence=Valence.NEGATIVE)
 
         await loop.assimilate(pos)  # confidence=1.0
-        await loop.assimilate(neg)  # confidence=0.5
-        await loop.assimilate(neg)  # confidence=0.0 → death → new negative belief
+        await loop.assimilate(neg)  # confidence -= 1.0*0.5 = 0.5
+        await loop.assimilate(neg)  # confidence -= 1.0*0.5 = 0.0 → death
 
         beliefs = await loop.backend.all_beliefs()
-        # Original weakened + new replacement
+        # Original weakened + new replacement + conditional insights
         assert any(b.valence == Valence.NEGATIVE and b.confidence == 1.0 for b in beliefs)
 
     async def test_metric_shift_detection(self, loop):
@@ -1354,7 +1359,13 @@ class TestStrategyBundling:
 @pytest.mark.asyncio
 class TestCrisisDetection:
     async def test_crisis_mode_accelerates_weakening(self, loop):
-        """Consecutive contradictions make the system more plastic."""
+        """Consecutive contradictions make the system more plastic.
+
+        With contradiction-driven learning, base weakening is halved (0.5x),
+        but crisis mode (3x at 3+ contradictions) still accelerates.
+        Effective drops: 0.15 + 0.15 + 0.45 = 0.75
+        Non-crisis would be: 3 × 0.15 = 0.45
+        """
         # crisis acceleration is built-in (3.0x after 3 consecutive contradictions)
 
         # Establish a strong belief
@@ -1378,9 +1389,9 @@ class TestCrisisDetection:
         old = [b for b in beliefs if "old strategy" in b.description][0]
         total_drop = conf_before - old.confidence
 
-        # Compare: without crisis, drop would be 3 × 0.3 = 0.9
-        # With crisis (kicks in at contradiction 3): 0.3 + 0.3 + 0.9 = 1.5
-        assert total_drop > 0.9 * 1.3  # at least 30% more than non-crisis
+        # With half-rate weakening: non-crisis = 3 × 0.15 = 0.45
+        # With crisis (3x on 3rd): 0.15 + 0.15 + 0.45 = 0.75
+        assert total_drop > 0.45 * 1.3  # at least 30% more than non-crisis
 
     async def test_agreement_resets_crisis(self, loop):
         """One agreement resets the contradiction streak."""
@@ -1410,7 +1421,12 @@ class TestCrisisDetection:
         assert loop._contradiction_streak == 0
 
     async def test_crisis_accelerates_after_three(self, loop):
-        """Crisis mode kicks in at exactly 3 consecutive contradictions."""
+        """Crisis mode kicks in at exactly 3 consecutive contradictions.
+
+        With contradiction-driven learning, effective weakening is halved.
+        First two: 0.3 * 0.5 = 0.15 each
+        Third (crisis 3x): 0.3 * 3.0 * 0.5 = 0.45
+        """
         # Build up moderate confidence
         for _ in range(5):
             await loop.assimilate(Observation(
@@ -1421,7 +1437,7 @@ class TestCrisisDetection:
         beliefs = await loop.backend.all_beliefs()
         conf_before = beliefs[0].confidence
 
-        # First two contradictions: normal weaken_rate
+        # First two contradictions: halved weaken_rate
         await loop.assimilate(Observation(
             capability="x", description="belief",
             valence=Valence.NEGATIVE,
@@ -1434,10 +1450,10 @@ class TestCrisisDetection:
         beliefs = await loop.backend.all_beliefs()
         old = [b for b in beliefs if "belief" in b.description][0]
         drop_after_2 = conf_before - old.confidence
-        # Should be 2 × 0.3 = 0.6
-        assert abs(drop_after_2 - 2 * loop.weaken_rate) < 0.01
+        # Should be 2 × 0.3 × 0.5 = 0.3 (halved rate)
+        assert abs(drop_after_2 - 2 * loop.weaken_rate * 0.5) < 0.01
 
-        # Third contradiction: crisis kicks in (3.0x multiplier)
+        # Third contradiction: crisis kicks in (3.0x multiplier, still halved)
         await loop.assimilate(Observation(
             capability="x", description="belief",
             valence=Valence.NEGATIVE,
@@ -1445,8 +1461,8 @@ class TestCrisisDetection:
         beliefs = await loop.backend.all_beliefs()
         old = [b for b in beliefs if "belief" in b.description][0]
         total_drop = conf_before - old.confidence
-        # Should be 0.3 + 0.3 + 0.9 = 1.5 (third hit is 3x)
-        assert total_drop > 2 * loop.weaken_rate + loop.weaken_rate * 1.5
+        # Should be 0.15 + 0.15 + 0.45 = 0.75 (third hit is 3x × 0.5)
+        assert total_drop > 2 * loop.weaken_rate * 0.5 + loop.weaken_rate * 0.5
 
     async def test_streak_decays_on_forget(self, loop):
         """Between-runs decay prevents slow-burn false crises."""

@@ -19,10 +19,10 @@ from ganglion.memory.embed import (
     set_embedder,
 )
 from ganglion.memory.loop import MemoryLoop
-from ganglion.memory.reflect import reflect
+from ganglion.memory.reflect import reflect, reflect_experience
 from ganglion.memory.similarity import jaccard_similarity, tokenize
 from ganglion.memory.synthesize import synthesize
-from ganglion.memory.types import Belief, Delta, Observation, Valence
+from ganglion.memory.types import Belief, Delta, Experience, Observation, Valence
 from ganglion.memory.wrap import memory
 
 __all__ = [
@@ -32,6 +32,7 @@ __all__ = [
     "Belief",
     "Delta",
     "Valence",
+    "Experience",
     # Similarity
     "jaccard_similarity",
     "tokenize",
@@ -47,6 +48,7 @@ __all__ = [
     "temporal_neighbors",
     # Intelligence layer
     "reflect",
+    "reflect_experience",
     "synthesize",
     # Agent integration
     "MemoryAgent",
