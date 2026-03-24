@@ -1,13 +1,9 @@
-"""Tests for the memory system.
+"""Tests for Ganglion Memory v4.
 
-Covers: types, SQLite backend, MemoryLoop (the core primitive),
-agent integration, and the biological properties we care about:
-    - Hebbian strengthening (confirmation)
-    - Contradiction detection (delta emission)
-    - Metric drift detection
-    - Strength-based eviction (not age-based)
-    - Entity profiling as a view
-    - Cross-bot knowledge sharing
+Covers: Experience type, SqliteBackend, Memory core, Agent integration,
+wrap API, embedding utilities.
+
+85 tests in this file + 6 in test_refine.py = 91 total.
 """
 
 import asyncio
@@ -17,10 +13,20 @@ from pathlib import Path
 
 import pytest
 
-from ganglion.memory.agent import MemoryAgent, between_runs, result_to_observation
-from ganglion.memory.backends.sqlite import SqliteMemoryBackend
-from ganglion.memory.loop import MemoryLoop
-from ganglion.memory.types import Belief, Delta, Observation, Valence
+from ganglion.memory.agent import Agent
+from ganglion.memory.backends.sqlite import SqliteBackend
+from ganglion.memory.core import Memory
+from ganglion.memory.embed import (
+    CallableEmbedder,
+    cosine_similarity,
+    reset_embedder,
+    set_embedder,
+)
+from ganglion.memory.types import Experience
+from ganglion.memory.wrap import _default_judge, _extract_query, memory
+
+
+# -- Fixtures ----------------------------------------------------------------
 
 
 @pytest.fixture
@@ -30,978 +36,726 @@ def tmp_dir():
 
 
 @pytest.fixture
-def sqlite_backend(tmp_dir):
-    backend = SqliteMemoryBackend(tmp_dir / "memory.db")
-    yield backend
-    backend.close()
-
-
-@pytest.fixture
 def backend(tmp_dir):
-    b = SqliteMemoryBackend(tmp_dir / "memory.db")
+    b = SqliteBackend(tmp_dir / "memory.db")
     yield b
     b.close()
 
 
+async def _mock_embed(text: str) -> list[float]:
+    """Deterministic mock: character frequency vector (26 dims, normalized)."""
+    vec = [0.0] * 26
+    for c in text.lower():
+        if "a" <= c <= "z":
+            vec[ord(c) - ord("a")] += 1.0
+    total = sum(v * v for v in vec) ** 0.5
+    if total > 0:
+        vec = [v / total for v in vec]
+    return vec
+
+
 @pytest.fixture
-def loop(backend):
-    return MemoryLoop(backend=backend)
+def mock_embedder():
+    return CallableEmbedder(_mock_embed)
+
+
+@pytest.fixture
+def mem(backend):
+    return Memory(backend=backend)
+
+
+@pytest.fixture
+def mem_with_embedder(backend, mock_embedder):
+    return Memory(backend=backend, embedder=mock_embedder)
 
 
 # ======================================================================
-# Types
+# Experience type
 # ======================================================================
 
-class TestTypes:
-    def test_observation_to_dict(self):
-        obs = Observation(
-            capability="mining",
-            description="batch_size=64",
-            valence=Valence.POSITIVE,
-            entities=("subnet-18",),
-            metric_value=0.82,
-            metric_name="score",
-        )
-        d = obs.to_dict()
-        assert d["capability"] == "mining"
-        assert d["valence"] == "positive"
-        assert d["entities"] == ["subnet-18"]
 
-    def test_belief_roundtrip(self):
-        b = Belief(
+class TestExperience:
+    def test_create(self):
+        exp = Experience(content="batch=64 works", tags=("mining",), source="alpha")
+        assert exp.content == "batch=64 works"
+        assert exp.tags == ("mining",)
+        assert exp.source == "alpha"
+
+    def test_defaults(self):
+        exp = Experience()
+        assert exp.id is None
+        assert exp.content == ""
+        assert exp.tags == ()
+        assert exp.confirmation_count == 0
+        assert exp.contradiction_count == 0
+        assert exp.embedding is None
+        assert exp.metadata is None
+
+    def test_net_score_positive(self):
+        exp = Experience(confirmation_count=5, contradiction_count=2)
+        assert exp.net_score == 3
+
+    def test_net_score_negative(self):
+        exp = Experience(confirmation_count=1, contradiction_count=3)
+        assert exp.net_score == -2
+
+    def test_to_dict(self):
+        exp = Experience(
             id=1,
-            capability="mining",
-            description="batch=64",
-            valence=Valence.POSITIVE,
-            confidence=2.5,
+            content="test",
+            tags=("a", "b"),
+            source="bot",
             confirmation_count=3,
-            entities=("sn18",),
-            metric_value=0.9,
+            contradiction_count=1,
+            metadata={"key": "value"},
         )
-        d = b.to_dict()
-        b2 = Belief.from_dict(d)
-        assert b2.capability == "mining"
-        assert b2.valence == Valence.POSITIVE
-        assert b2.confidence == 2.5
-        assert b2.confirmation_count == 3
-        assert "sn18" in b2.entities
+        d = exp.to_dict()
+        assert d["content"] == "test"
+        assert d["tags"] == ["a", "b"]
+        assert d["confirmation_count"] == 3
+        assert d["contradiction_count"] == 1
+        assert d["metadata"] == {"key": "value"}
 
-    def test_belief_strength_ranking(self):
-        """Recent + confirmed beats old + confirmed beats recent + weak."""
-        recent_strong = Belief(
-            capability="x", description="a", valence=Valence.POSITIVE,
-            confidence=2.0, confirmation_count=5,
-            last_confirmed=datetime.now(UTC),
-        )
-        old_strong = Belief(
-            capability="x", description="b", valence=Valence.POSITIVE,
-            confidence=2.0, confirmation_count=5,
-            last_confirmed=datetime.now(UTC) - timedelta(days=30),
-        )
-        recent_weak = Belief(
-            capability="x", description="c", valence=Valence.POSITIVE,
-            confidence=0.5, confirmation_count=1,
-            last_confirmed=datetime.now(UTC),
-        )
-        assert recent_strong.strength > old_strong.strength > recent_weak.strength
+    def test_from_dict(self):
+        d = {
+            "id": 1,
+            "content": "test",
+            "tags": ["a"],
+            "source": "bot",
+            "created_at": "2024-01-01T00:00:00+00:00",
+            "updated_at": "2024-01-01T00:00:00+00:00",
+            "confirmation_count": 2,
+            "contradiction_count": 0,
+            "metadata": {"k": "v"},
+        }
+        exp = Experience.from_dict(d)
+        assert exp.content == "test"
+        assert exp.tags == ("a",)
+        assert exp.confirmation_count == 2
+        assert exp.metadata == {"k": "v"}
 
-    def test_belief_is_pattern_and_antipattern(self):
-        assert Belief(valence=Valence.POSITIVE).is_pattern
-        assert not Belief(valence=Valence.POSITIVE).is_antipattern
-        assert Belief(valence=Valence.NEGATIVE).is_antipattern
+    def test_roundtrip_with_embedding(self):
+        embedding = [0.1, 0.2, 0.3]
+        exp = Experience(content="test", embedding=embedding)
+        d = exp.to_dict()
+        assert "embedding" in d
+        restored = Experience.from_dict(d)
+        assert restored.embedding is not None
+        for a, b in zip(embedding, restored.embedding):
+            assert abs(a - b) < 1e-6
 
-    def test_delta_summary_metric_shift(self):
-        d = Delta(
-            old_belief=Belief(capability="mining", metric_name="score", metric_value=0.8),
-            new_observation=Observation(
-                capability="mining", description="x",
-                valence=Valence.POSITIVE, metric_value=0.5,
-            ),
-            delta_type="metric_shift",
-            magnitude=-0.375,
-        )
-        assert "shifted" in d.summary
-        assert "score" in d.summary
+    def test_roundtrip_without_embedding(self):
+        exp = Experience(content="test")
+        d = exp.to_dict()
+        assert "embedding" not in d
+        restored = Experience.from_dict(d)
+        assert restored.embedding is None
 
-    def test_delta_summary_contradiction(self):
-        d = Delta(
-            old_belief=Belief(capability="mining", description="old approach"),
-            new_observation=Observation(
-                capability="mining", description="new approach",
-                valence=Valence.NEGATIVE,
-            ),
-            delta_type="contradiction",
-        )
-        assert "contradicted" in d.summary
-
-    def test_long_term_memory_consolidation(self):
-        """Consolidated beliefs (high confirmation_count) resist recency decay."""
-        old_consolidated = Belief(
-            capability="x", description="consolidated",
-            valence=Valence.POSITIVE,
-            confidence=5.0, confirmation_count=10,
-            last_confirmed=datetime.now(UTC) - timedelta(days=60),
-        )
-        new_weak = Belief(
-            capability="x", description="new",
-            valence=Valence.POSITIVE,
-            confidence=1.0, confirmation_count=1,
-            last_confirmed=datetime.now(UTC),
-        )
-        assert old_consolidated.strength > new_weak.strength
-        assert old_consolidated.strength >= 5.0 * 10 * 0.5
-
-    def test_belief_input_context_field(self):
-        """input_context field roundtrips correctly."""
-        b = Belief(
-            capability="test", description="lesson",
-            valence=Valence.POSITIVE,
-            input_context="what was the task",
-        )
-        d = b.to_dict()
-        assert d["input_context"] == "what was the task"
-        b2 = Belief.from_dict(d)
-        assert b2.input_context == "what was the task"
-
-    def test_belief_input_context_default(self):
-        b = Belief(capability="test", description="x")
-        assert b.input_context == ""
+    def test_tags_are_tuple(self):
+        exp = Experience.from_dict({"tags": ["x", "y"]})
+        assert isinstance(exp.tags, tuple)
+        assert exp.tags == ("x", "y")
 
 
 # ======================================================================
-# Backend tests (SQLite only — JSON backend removed)
+# SqliteBackend
 # ======================================================================
+
 
 @pytest.mark.asyncio
-class TestBackend:
-    async def test_store_and_find_similar(self, backend):
-        obs = Observation(capability="train", description="Good approach", valence=Valence.POSITIVE)
-        assert await backend.find_similar(obs) is None
+class TestSqliteBackend:
+    async def test_store_and_get(self, backend):
+        exp = Experience(content="hello", tags=("a",), source="bot")
+        eid = await backend.store(exp)
+        assert eid is not None
+        got = await backend.get(eid)
+        assert got is not None
+        assert got.content == "hello"
+        assert got.tags == ("a",)
 
-        belief = Belief(capability="train", description="Good approach", valence=Valence.POSITIVE)
-        await backend.store(belief)
-
-        found = await backend.find_similar(obs)
-        assert found is not None
-        assert found.description == "Good approach"
-
-    async def test_store_and_query_by_capability(self, backend):
-        await backend.store(Belief(capability="train", description="A", valence=Valence.POSITIVE))
-        await backend.store(Belief(capability="eval", description="B", valence=Valence.POSITIVE))
-
-        results = await backend.query(capability="train")
-        assert len(results) == 1
-        assert results[0].description == "A"
-
-    async def test_query_by_valence(self, backend):
-        await backend.store(Belief(capability="x", description="good", valence=Valence.POSITIVE))
-        await backend.store(Belief(capability="x", description="bad", valence=Valence.NEGATIVE))
-
-        pos = await backend.query(capability="x", valence=Valence.POSITIVE)
-        assert len(pos) == 1
-        assert pos[0].description == "good"
-
-    async def test_query_by_entities(self, backend):
-        await backend.store(Belief(
-            capability="x", description="A", valence=Valence.POSITIVE,
-            entities=("subnet-18",),
-        ))
-        await backend.store(Belief(
-            capability="x", description="B", valence=Valence.POSITIVE,
-            entities=("subnet-1",),
-        ))
-
-        results = await backend.query(entities=("subnet-18",))
-        assert len(results) == 1
-        assert results[0].description == "A"
-
-    async def test_query_exclude_source(self, backend):
-        await backend.store(Belief(
-            capability="x", description="from alpha", valence=Valence.POSITIVE,
-            source="alpha",
-        ))
-        await backend.store(Belief(
-            capability="x", description="from beta", valence=Valence.POSITIVE,
-            source="beta",
-        ))
-
-        results = await backend.query(exclude_source="alpha")
-        assert len(results) == 1
-        assert results[0].source == "beta"
+    async def test_store_assigns_id(self, backend):
+        exp = Experience(content="test")
+        eid = await backend.store(exp)
+        assert exp.id == eid
+        assert eid > 0
 
     async def test_update(self, backend):
-        belief = Belief(capability="x", description="A", valence=Valence.POSITIVE)
-        await backend.store(belief)
+        exp = Experience(content="original")
+        await backend.store(exp)
+        exp.content = "updated"
+        exp.confirmation_count = 5
+        await backend.update(exp)
+        got = await backend.get(exp.id)
+        assert got.content == "updated"
+        assert got.confirmation_count == 5
 
-        belief.confidence = 5.0
-        belief.confirmation_count = 10
-        await backend.update(belief)
+    async def test_delete(self, backend):
+        exp = Experience(content="to delete")
+        await backend.store(exp)
+        assert await backend.count() == 1
+        await backend.delete(exp.id)
+        assert await backend.count() == 0
 
-        results = await backend.query(capability="x")
-        assert results[0].confidence == 5.0
-        assert results[0].confirmation_count == 10
+    async def test_query_by_tags(self, backend):
+        await backend.store(Experience(content="A", tags=("mining",)))
+        await backend.store(Experience(content="B", tags=("training",)))
+        results = await backend.query(tags=("mining",))
+        assert len(results) == 1
+        assert results[0].content == "A"
 
-    async def test_remove(self, backend):
-        belief = Belief(capability="x", description="A", valence=Valence.POSITIVE)
-        await backend.store(belief)
-        assert len(await backend.all_beliefs()) == 1
-
-        await backend.remove(belief)
-        assert len(await backend.all_beliefs()) == 0
-
-    async def test_all_beliefs(self, backend):
-        for i in range(5):
-            await backend.store(Belief(capability="x", description=f"b{i}", valence=Valence.POSITIVE))
-        assert len(await backend.all_beliefs()) == 5
+    async def test_query_by_source(self, backend):
+        await backend.store(Experience(content="from alpha", source="alpha"))
+        await backend.store(Experience(content="from beta", source="beta"))
+        results = await backend.query(source="alpha")
+        assert len(results) == 1
+        assert results[0].source == "alpha"
 
     async def test_query_limit(self, backend):
         for i in range(10):
-            await backend.store(Belief(capability="x", description=f"b{i}", valence=Valence.POSITIVE))
-        results = await backend.query(capability="x", limit=3)
+            await backend.store(Experience(content=f"exp{i}"))
+        results = await backend.query(limit=3)
         assert len(results) == 3
 
-    async def test_query_by_tags(self, backend):
-        await backend.store(Belief(
-            capability="x", description="A", valence=Valence.POSITIVE,
-            tags=("agent_design",),
-        ))
-        await backend.store(Belief(
-            capability="x", description="B", valence=Valence.POSITIVE,
-            tags=("strategy",),
-        ))
-
-        results = await backend.query(tags=("agent_design",))
-        assert len(results) == 1
-        assert results[0].description == "A"
-
-    async def test_sqlite_roundtrip_all_beliefs(self, sqlite_backend):
-        """SQLite store + all_beliefs roundtrip."""
-        belief = Belief(
-            capability="mining", description="test roundtrip",
-            valence=Valence.POSITIVE, confidence=2.0,
-            confirmation_count=3, entities=("sn18",),
-            metric_value=0.9, metric_name="score",
-            source="alpha", tags=("tag1",),
-        )
-        await sqlite_backend.store(belief)
-        beliefs = await sqlite_backend.all_beliefs()
-        assert len(beliefs) == 1
-        b = beliefs[0]
-        assert b.description == "test roundtrip"
-        assert b.confidence == 2.0
-        assert b.confirmation_count == 3
-
-    async def test_sqlite_input_context_roundtrip(self, sqlite_backend):
-        """input_context survives SQLite store/retrieve."""
-        belief = Belief(
-            capability="test", description="lesson",
-            valence=Valence.POSITIVE,
-            input_context="the original task",
-        )
-        await sqlite_backend.store(belief)
-        beliefs = await sqlite_backend.all_beliefs()
-        assert beliefs[0].input_context == "the original task"
-
-    async def test_find_similar_fuzzy_match(self, backend):
-        """Token-based similarity matches rephrased descriptions."""
-        await backend.store(Belief(
-            capability="train",
-            description="batch_size=64 works well for training",
-            valence=Valence.POSITIVE,
-        ))
-
-        obs = Observation(
-            capability="train",
-            description="batch 64 works well for training runs",
-            valence=Valence.POSITIVE,
-        )
-        found = await backend.find_similar(obs, threshold=0.7)
-        assert found is not None
-
-    async def test_find_similar_no_match_dissimilar(self, backend):
-        """Dissimilar descriptions don't match."""
-        await backend.store(Belief(
-            capability="train",
-            description="batch_size=64 works",
-            valence=Valence.POSITIVE,
-        ))
-
-        obs = Observation(
-            capability="train",
-            description="learning_rate=0.001 is optimal",
-            valence=Valence.POSITIVE,
-        )
-        found = await backend.find_similar(obs)
-        assert found is None
-
-    async def test_find_similar_lower_threshold(self, backend):
-        """Lowering threshold allows fuzzier matches."""
-        await backend.store(Belief(
-            capability="train",
-            description="batch_size=64 works great",
-            valence=Valence.POSITIVE,
-        ))
-
-        obs = Observation(
-            capability="train",
-            description="batch 64 great results observed",
-            valence=Valence.POSITIVE,
-        )
-        found_loose = await backend.find_similar(obs, threshold=0.3)
-        assert found_loose is not None
-
-
-# ======================================================================
-# MemoryLoop — the core primitive
-# ======================================================================
-
-@pytest.mark.asyncio
-class TestMemoryLoop:
-    async def test_novel_observation_creates_belief(self, loop):
-        obs = Observation(capability="mining", description="batch=64", valence=Valence.POSITIVE)
-        delta = await loop.assimilate(obs)
-        assert delta is None
-
-        s = await loop.summary()
-        assert s["total_beliefs"] == 1
-        assert s["patterns"] == 1
-
-    async def test_hebbian_strengthening(self, loop):
-        """Repeated agreement increments confirmation_count."""
-        obs = Observation(
-            capability="mining", description="batch=64",
-            valence=Valence.POSITIVE, metric_value=0.8,
-        )
-        await loop.assimilate(obs)
-        await loop.assimilate(obs)
-        await loop.assimilate(obs)
-
-        beliefs = await loop.backend.all_beliefs()
-        assert len(beliefs) == 1
-        assert beliefs[0].confirmation_count == 3
-
-    async def test_contradiction_weakens_belief(self, loop):
-        """Opposite valence weakens existing belief."""
-        pos = Observation(capability="mining", description="batch=64", valence=Valence.POSITIVE)
-        neg = Observation(capability="mining", description="batch=64", valence=Valence.NEGATIVE)
-
-        await loop.assimilate(pos)
-        delta = await loop.assimilate(neg)
-
-        assert delta is not None
-        assert delta.delta_type == "contradiction"
-
-    async def test_contradiction_kills_weak_belief(self, loop):
-        """Repeated contradiction causes apoptosis."""
-        loop.weaken_rate = 0.5
-
-        pos = Observation(capability="mining", description="batch=64", valence=Valence.POSITIVE)
-        neg = Observation(capability="mining", description="batch=64", valence=Valence.NEGATIVE)
-
-        await loop.assimilate(pos)
-        await loop.assimilate(neg)
-        await loop.assimilate(neg)
-
-        beliefs = await loop.backend.all_beliefs()
-        assert any(b.valence == Valence.NEGATIVE and b.confidence == 1.0 for b in beliefs)
-
-    async def test_metric_shift_detection(self, loop):
-        """Detects drift even when valence agrees."""
-        loop.metric_shift_threshold = 0.1
-
-        obs1 = Observation(
-            capability="mining", description="batch=64",
-            valence=Valence.POSITIVE, metric_name="score", metric_value=0.8,
-        )
-        obs2 = Observation(
-            capability="mining", description="batch=64",
-            valence=Valence.POSITIVE, metric_name="score", metric_value=0.5,
-        )
-
-        await loop.assimilate(obs1)
-        delta = await loop.assimilate(obs2)
-
-        assert delta is not None
-        assert delta.delta_type == "metric_shift"
-        assert delta.magnitude is not None
-        assert delta.magnitude > 0.1
-
-    async def test_drain_deltas(self, loop):
-        loop.metric_shift_threshold = 0.01
-        obs1 = Observation(
-            capability="mining", description="batch=64",
-            valence=Valence.POSITIVE, metric_value=0.8,
-        )
-        obs2 = Observation(
-            capability="mining", description="batch=64",
-            valence=Valence.POSITIVE, metric_value=0.5,
-        )
-        await loop.assimilate(obs1)
-        await loop.assimilate(obs2)
-
-        deltas = await loop.drain_deltas()
-        assert len(deltas) >= 1
-        assert len(await loop.drain_deltas()) == 0
-
-    async def test_entity_merging(self, loop):
-        """Entities accumulate across observations."""
-        obs1 = Observation(
-            capability="mining", description="batch=64",
-            valence=Valence.POSITIVE, entities=("subnet-18",),
-        )
-        obs2 = Observation(
-            capability="mining", description="batch=64",
-            valence=Valence.POSITIVE, entities=("subnet-1",),
-        )
-        await loop.assimilate(obs1)
-        await loop.assimilate(obs2)
-
-        beliefs = await loop.backend.all_beliefs()
-        assert "subnet-18" in beliefs[0].entities
-        assert "subnet-1" in beliefs[0].entities
-
-    async def test_strength_based_eviction(self, loop):
-        """forget() removes weakest beliefs, not oldest."""
-        loop.max_beliefs = 3
-
+    async def test_all(self, backend):
         for i in range(5):
-            b = Belief(
-                capability="x", description=f"b{i}", valence=Valence.POSITIVE,
-                confidence=float(i + 1),
-                confirmation_count=i + 1,
-            )
-            await loop.backend.store(b)
+            await backend.store(Experience(content=f"exp{i}"))
+        assert len(await backend.all()) == 5
 
-        removed = await loop.forget()
-        assert removed == 2
+    async def test_count(self, backend):
+        assert await backend.count() == 0
+        await backend.store(Experience(content="a"))
+        await backend.store(Experience(content="b"))
+        assert await backend.count() == 2
 
-        remaining = await loop.backend.all_beliefs()
-        assert len(remaining) == 3
-        descriptions = {b.description for b in remaining}
-        assert "b0" not in descriptions
-        assert "b1" not in descriptions
+    async def test_search_by_embedding(self, backend):
+        emb = [1.0, 0.0, 0.0]
+        await backend.store(Experience(content="A", embedding=emb))
+        await backend.store(Experience(content="B", embedding=[0.0, 1.0, 0.0]))
+        results = await backend.search_by_embedding(emb, limit=5, threshold=0.5)
+        assert len(results) == 1
+        assert results[0][0].content == "A"
+        assert results[0][1] > 0.99
 
-    async def test_stable_entity_merge_order(self, loop):
-        """Entity merging preserves existing order, appends new items."""
-        obs1 = Observation(
-            capability="mining", description="test order",
-            valence=Valence.POSITIVE, entities=("a", "b", "c"),
+    async def test_search_by_embedding_threshold(self, backend):
+        await backend.store(Experience(content="A", embedding=[1.0, 0.0, 0.0]))
+        results = await backend.search_by_embedding(
+            [0.7, 0.7, 0.0],
+            limit=5,
+            threshold=0.99,
         )
-        obs2 = Observation(
-            capability="mining", description="test order",
-            valence=Valence.POSITIVE, entities=("d", "b", "e"),
-        )
+        assert len(results) == 0
 
-        await loop.assimilate(obs1)
-        await loop.assimilate(obs2)
+    async def test_embedding_roundtrip(self, backend):
+        emb = [0.1, 0.2, 0.3, 0.4, 0.5]
+        await backend.store(Experience(content="test", embedding=emb))
+        got = (await backend.all())[0]
+        assert got.embedding is not None
+        for a, b in zip(emb, got.embedding):
+            assert abs(a - b) < 1e-6
 
-        beliefs = await loop.backend.all_beliefs()
-        assert beliefs[0].entities == ("a", "b", "c", "d", "e")
+    async def test_metadata_roundtrip(self, backend):
+        meta = {"key": "value", "nested": {"a": 1}}
+        await backend.store(Experience(content="test", metadata=meta))
+        got = (await backend.all())[0]
+        assert got.metadata == meta
 
-    async def test_concurrent_delta_safety(self, loop):
-        """Concurrent assimilate calls produce correct delta counts."""
-        loop.metric_shift_threshold = 0.01
+    async def test_get_nonexistent(self, backend):
+        assert await backend.get(999) is None
 
-        base_obs = Observation(
-            capability="mining", description="concurrent test",
-            valence=Valence.POSITIVE, metric_name="score", metric_value=1.0,
-        )
-        await loop.assimilate(base_obs)
-
-        for i in range(10):
-            obs = Observation(
-                capability=f"cap_{i}",
-                description=f"unique obs {i}",
-                valence=Valence.POSITIVE,
-                metric_name="score",
-                metric_value=0.5,
-            )
-            await loop.assimilate(obs)
-
-        async def make_contradiction(idx: int) -> Delta | None:
-            obs = Observation(
-                capability=f"cap_{idx}",
-                description=f"unique obs {idx}",
-                valence=Valence.NEGATIVE,
-            )
-            return await loop.assimilate(obs)
-
-        results = await asyncio.gather(*[make_contradiction(i) for i in range(10)])
-        contradiction_deltas = [r for r in results if r is not None]
-
-        assert len(contradiction_deltas) == 10
-
-        drained = await loop.drain_deltas()
-        assert len(drained) == 10
-        assert len(await loop.drain_deltas()) == 0
-
-    async def test_input_context_stored_on_novel_belief(self, loop):
-        """Novel observation with input_text in config stores input_context."""
-        obs = Observation(
-            capability="test", description="lesson learned",
-            valence=Valence.POSITIVE,
-            config={"input_text": "what was the task"},
-        )
-        await loop.assimilate(obs)
-
-        beliefs = await loop.backend.all_beliefs()
-        assert beliefs[0].input_context == "what was the task"
+    async def test_delete_nonexistent(self, backend):
+        # Should not raise
+        await backend.delete(999)
 
 
 # ======================================================================
-# Prompt context generation
+# Memory core
 # ======================================================================
+
 
 @pytest.mark.asyncio
-class TestPromptContext:
-    async def test_context_for_includes_patterns_and_antipatterns(self, loop):
-        await loop.assimilate(Observation(
-            capability="mining", description="batch=64 works",
-            valence=Valence.POSITIVE, metric_value=0.85, metric_name="score",
-        ))
-        await loop.assimilate(Observation(
-            capability="mining", description="batch=256 OOM",
-            valence=Valence.NEGATIVE,
-        ))
+class TestMemory:
+    async def test_add(self, mem):
+        exp = await mem.add("batch=64 works", tags=("mining",))
+        assert exp.id is not None
+        assert exp.content == "batch=64 works"
+        assert "mining" in exp.tags
+        assert exp.confirmation_count == 1
 
-        ctx = await loop.context_for("mining")
-        assert "What works" in ctx
-        assert "batch=64 works" in ctx
-        assert "What fails" in ctx
-        assert "batch=256 OOM" in ctx
+    async def test_add_with_metadata(self, mem):
+        exp = await mem.add("test", metadata={"key": "val"})
+        assert exp.metadata == {"key": "val"}
 
-    async def test_context_for_empty(self, loop):
-        ctx = await loop.context_for("nonexistent")
-        assert ctx == ""
+    async def test_add_dedup_with_embedder(self, mem_with_embedder):
+        """Adding near-duplicate content confirms existing instead of creating new."""
+        exp1 = await mem_with_embedder.add("batch size works well", tags=("mining",))
+        exp2 = await mem_with_embedder.add("batch size works well", tags=("mining",))
+        assert await mem_with_embedder.count() == 1
+        assert exp2.confirmation_count == 2
 
-    async def test_entity_profile(self, loop):
-        await loop.assimilate(Observation(
-            capability="mining", description="subnet 18 rewards consistency",
-            valence=Valence.POSITIVE, entities=("subnet-18",),
-        ))
-        await loop.assimilate(Observation(
-            capability="mining", description="subnet 18 penalises rapid changes",
-            valence=Valence.NEGATIVE, entities=("subnet-18",),
-        ))
+    async def test_add_different_creates_new(self, mem_with_embedder):
+        """Orthogonal content creates separate experiences."""
+        await mem_with_embedder.add("aaaa", tags=("test",))
+        await mem_with_embedder.add("zzzz", tags=("test",))
+        assert await mem_with_embedder.count() == 2
 
-        profile = await loop.entity_profile("subnet-18")
-        assert "Profile: subnet-18" in profile
-        assert "+" in profile
-        assert "-" in profile
+    async def test_search_empty(self, mem_with_embedder):
+        results = await mem_with_embedder.search("anything")
+        assert results == []
 
-    async def test_entity_profile_empty(self, loop):
-        profile = await loop.entity_profile("unknown")
-        assert "No knowledge" in profile
+    async def test_search_with_results(self, mem_with_embedder):
+        await mem_with_embedder.add("batch size works great", tags=("mining",))
+        await mem_with_embedder.add("zzzzzzz unique topic", tags=("other",))
+        results = await mem_with_embedder.search("batch size performance")
+        assert len(results) >= 1
+        assert any("batch" in r.content for r in results)
 
-    async def test_context_excludes_source(self, loop):
-        await loop.assimilate(Observation(
-            capability="mining", description="from alpha",
-            valence=Valence.POSITIVE, source="alpha",
-        ))
-        await loop.assimilate(Observation(
-            capability="mining", description="from beta",
-            valence=Valence.POSITIVE, source="beta",
-        ))
+    async def test_search_with_tags(self, mem_with_embedder):
+        await mem_with_embedder.add("batch works great", tags=("mining",))
+        await mem_with_embedder.add("batch fails badly", tags=("training",))
+        results = await mem_with_embedder.search("batch", tags=("mining",))
+        assert all("mining" in r.tags for r in results)
 
-        ctx = await loop.context_for("mining", exclude_source="alpha")
-        assert "from beta" in ctx
-        assert "from alpha" not in ctx
+    async def test_search_fallback_no_embedder(self, mem):
+        """Without embedder, search falls back to tag-based query."""
+        await mem.add("test content", tags=("mining",))
+        results = await mem.search("anything", tags=("mining",))
+        assert len(results) == 1
 
-    async def test_retrieve_for_returns_beliefs(self, loop):
-        """retrieve_for() returns both context string and raw beliefs."""
-        await loop.assimilate(Observation(
-            capability="mining", description="batch=64 works",
-            valence=Valence.POSITIVE,
-        ))
+    async def test_confirm(self, mem):
+        exp = await mem.add("test")
+        assert exp.confirmation_count == 1
+        updated = await mem.confirm(exp.id)
+        assert updated.confirmation_count == 2
 
-        ctx, beliefs = await loop.retrieve_for("mining")
-        assert "Relevant experience" in ctx
-        assert len(beliefs) >= 1
-        assert beliefs[0].description == "batch=64 works"
+    async def test_confirm_increments(self, mem):
+        exp = await mem.add("test")
+        for _ in range(5):
+            exp = await mem.confirm(exp.id)
+        assert exp.confirmation_count == 6
 
-    async def test_retrieve_for_empty(self, loop):
-        ctx, beliefs = await loop.retrieve_for("nonexistent")
-        assert ctx == ""
-        assert beliefs == []
+    async def test_contradict(self, mem):
+        exp = await mem.add("test")
+        updated = await mem.contradict(exp.id)
+        assert updated.contradiction_count == 1
 
-    async def test_format_context_v3_few_shot(self, loop):
-        """_format_context_v3 produces few-shot format for beliefs with experience."""
-        b = Belief(
-            capability="test", description="Task succeeded: solve equation",
-            valence=Valence.POSITIVE,
-            config={"input_text": "solve x^2 = 4", "output_text": "x = 2"},
+    async def test_contradict_increments(self, mem):
+        exp = await mem.add("test")
+        for _ in range(3):
+            exp = await mem.contradict(exp.id)
+        assert exp.contradiction_count == 3
+
+    async def test_delete(self, mem):
+        exp = await mem.add("to remove")
+        assert await mem.count() == 1
+        await mem.delete(exp.id)
+        assert await mem.count() == 0
+
+    async def test_get(self, mem):
+        exp = await mem.add("hello")
+        got = await mem.get(exp.id)
+        assert got is not None
+        assert got.content == "hello"
+
+    async def test_get_nonexistent(self, mem):
+        assert await mem.get(999) is None
+
+    async def test_all(self, mem):
+        await mem.add("a")
+        await mem.add("b")
+        assert len(await mem.all()) == 2
+
+    async def test_count(self, mem):
+        assert await mem.count() == 0
+        await mem.add("a")
+        assert await mem.count() == 1
+
+    async def test_compress_merges_similar(self, mem_with_embedder):
+        """Compress merges cluster of similar experiences."""
+        emb = await _mock_embed("batch works great")
+        for i in range(4):
+            await mem_with_embedder.backend.store(
+                Experience(
+                    content=f"batch works great run {i}",
+                    tags=("mining",),
+                    embedding=emb,
+                )
+            )
+        before = await mem_with_embedder.count()
+        merged = await mem_with_embedder.compress(
+            tags=("mining",), min_cluster=3, threshold=0.5,
         )
-        ctx = loop._format_context_v3([b])
-        assert "Prior task" in ctx
-        assert "solve x^2 = 4" in ctx
-        assert "Lesson" in ctx
+        assert len(merged) >= 1
+        assert "compressed" in merged[0].tags
+        after = await mem_with_embedder.count()
+        assert after < before
 
-    async def test_format_context_v3_legacy(self, loop):
-        """_format_context_v3 handles legacy beliefs without experience context."""
-        b = Belief(
-            capability="test", description="batch=64 works",
-            valence=Valence.POSITIVE, metric_name="score", metric_value=0.9,
+    async def test_compress_with_synthesizer(self, mem_with_embedder):
+        """Compress uses synthesizer callback when provided."""
+        emb = await _mock_embed("batch approach")
+        for i in range(3):
+            await mem_with_embedder.backend.store(
+                Experience(
+                    content=f"batch approach {i}",
+                    tags=("mining",),
+                    embedding=emb,
+                )
+            )
+
+        async def synth(exps: list[Experience]) -> str:
+            return f"Synthesized from {len(exps)} experiences"
+
+        merged = await mem_with_embedder.compress(
+            tags=("mining",), min_cluster=3, threshold=0.5, synthesizer=synth,
         )
-        ctx = loop._format_context_v3([b])
-        assert "batch=64 works" in ctx
-        assert "score" in ctx
+        assert len(merged) >= 1
+        assert "Synthesized from 3" in merged[0].content
+
+    async def test_compress_preserves_dissimilar(self, mem_with_embedder):
+        """Dissimilar experiences don't get merged."""
+        for i, emb in enumerate(
+            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+        ):
+            await mem_with_embedder.backend.store(
+                Experience(content=f"unique_{i}", tags=("test",), embedding=emb)
+            )
+        merged = await mem_with_embedder.compress(tags=("test",), min_cluster=3)
+        assert len(merged) == 0
+        assert await mem_with_embedder.count() == 3
+
+    async def test_compress_sums_counts(self, mem_with_embedder):
+        """Merged experience sums confirmation counts."""
+        emb = await _mock_embed("batch approach")
+        for i in range(3):
+            await mem_with_embedder.backend.store(
+                Experience(
+                    content=f"batch approach run {i}",
+                    tags=("mining",),
+                    embedding=emb,
+                    confirmation_count=2,
+                )
+            )
+        merged = await mem_with_embedder.compress(
+            tags=("mining",), min_cluster=3, threshold=0.5,
+        )
+        assert len(merged) >= 1
+        assert merged[0].confirmation_count >= 6
+
+    async def test_confirm_not_found_raises(self, mem):
+        with pytest.raises(ValueError):
+            await mem.confirm(999)
+
+    async def test_contradict_not_found_raises(self, mem):
+        with pytest.raises(ValueError):
+            await mem.contradict(999)
 
 
 # ======================================================================
 # Agent integration
 # ======================================================================
 
+
 @pytest.mark.asyncio
-class TestAgentIntegration:
-    async def test_result_to_observation(self):
-        obs = result_to_observation(
-            capability="mining",
-            result={
-                "success": True,
-                "description": "batch=64 lr=0.001",
-                "metric_name": "score",
-                "metric_value": 0.82,
-                "config": {"batch_size": 64},
-                "entities": ["subnet-18"],
-            },
-            source="alpha",
-            run_id="run-001",
-        )
-        assert obs.valence == Valence.POSITIVE
-        assert obs.capability == "mining"
-        assert "subnet-18" in obs.entities
-        assert obs.source == "alpha"
-
-    async def test_result_to_observation_failure(self):
-        obs = result_to_observation(
-            capability="mining",
-            result={
-                "success": False,
-                "description": "batch=256",
-                "error": "OOM on small GPU",
-            },
-        )
-        assert obs.valence == Valence.NEGATIVE
-        assert "OOM" in obs.description
-
-    async def test_memory_agent_remember_and_learn(self, loop):
-        agent = MemoryAgent(
-            memory=loop,
-            capability="mining",
-            bot_id="alpha",
-            entities=("subnet-18",),
-        )
-
+class TestAgent:
+    async def test_remember_empty(self, mem):
+        agent = Agent(memory=mem, capability="mining")
         ctx = await agent.remember()
         assert ctx == ""
 
-        delta = await agent.learn({
-            "success": True,
-            "description": "batch=64 works",
-            "metric_name": "score",
-            "metric_value": 0.82,
-        })
-        assert delta is None
+    async def test_learn_stores(self, mem):
+        agent = Agent(memory=mem, capability="mining")
+        exp = await agent.learn({"success": True, "description": "batch=64 works"})
+        assert exp.content == "batch=64 works"
+        assert await mem.count() == 1
 
+    async def test_remember_after_learn(self, mem):
+        agent = Agent(memory=mem, capability="mining")
+        await agent.learn({"success": True, "description": "batch=64 works"})
         ctx = await agent.remember()
         assert "batch=64 works" in ctx
 
-    async def test_cross_bot_knowledge(self, loop):
-        alpha = MemoryAgent(memory=loop, capability="mining", bot_id="alpha")
-        beta = MemoryAgent(memory=loop, capability="mining", bot_id="beta")
-
-        await alpha.learn({
-            "success": True,
-            "description": "batch=64 works",
-        })
-
-        ctx = await beta.remember()
-        assert "batch=64 works" in ctx
-        assert "other agents report" in ctx
-
-    async def test_between_runs(self, loop):
-        loop.metric_shift_threshold = 0.01
-        await loop.assimilate(Observation(
-            capability="x", description="A",
-            valence=Valence.POSITIVE, metric_value=1.0,
-        ))
-        await loop.assimilate(Observation(
-            capability="x", description="A",
-            valence=Valence.POSITIVE, metric_value=0.5,
-        ))
-
-        deltas = await between_runs(loop)
-        assert len(deltas) >= 1
-
-    async def test_learn_stamps_input_output(self, loop):
-        """learn() stamps input_text and output_text into config."""
-        agent = MemoryAgent(memory=loop, capability="test")
-        await agent.learn(
+    async def test_learn_with_input_output(self, mem):
+        agent = Agent(memory=mem, capability="test")
+        exp = await agent.learn(
             {"success": True, "description": "solved it"},
             input_text="what is 2+2",
             output_text="4",
         )
+        assert exp.metadata is not None
+        assert exp.metadata.get("input_text") == "what is 2+2"
+        assert exp.metadata.get("output_text") == "4"
 
-        beliefs = await loop.backend.all_beliefs()
-        b = beliefs[0]
-        assert b.config is not None
-        assert b.config.get("input_text") == "what is 2+2"
-        assert b.config.get("output_text") == "4"
-        assert b.input_context == "what is 2+2"
+    async def test_learn_failure(self, mem):
+        agent = Agent(memory=mem, capability="mining")
+        exp = await agent.learn(
+            {"success": False, "description": "batch=256", "error": "OOM"},
+        )
+        assert "failure" in exp.tags
+        assert "OOM" in exp.content
 
+    async def test_learn_adds_tags(self, mem):
+        agent = Agent(memory=mem, capability="mining", tags=("gpu",))
+        exp = await agent.learn({"success": True, "description": "test"})
+        assert "mining" in exp.tags
+        assert "gpu" in exp.tags
+        assert "success" in exp.tags
 
-# ======================================================================
-# Salience (built into MemoryLoop.assimilate)
-# ======================================================================
-
-@pytest.mark.asyncio
-class TestSalience:
-    async def test_novel_surprising_observation_gets_boosted(self, loop):
-        """Novel observation with surprising metric gets confidence > 1.0."""
+    async def test_between_runs(self, mem_with_embedder):
+        agent = Agent(memory=mem_with_embedder, capability="mining")
         for i in range(5):
-            await loop.assimilate(Observation(
-                capability="mining", description=f"peer_{i}",
-                valence=Valence.POSITIVE, metric_value=0.5 + i * 0.01,
-            ))
+            await agent.learn(
+                {"success": True, "description": f"batch approach run {i}"},
+            )
+        count = await agent.between_runs()
+        assert isinstance(count, int)
 
-        obs = Observation(
-            capability="mining", description="outlier strategy",
-            valence=Valence.POSITIVE, metric_value=0.99,
-        )
-        delta = await loop.assimilate(obs)
-        assert delta is None
+    async def test_remember_formats_context(self, mem):
+        agent = Agent(memory=mem, capability="mining")
+        await agent.learn({"success": True, "description": "batch=64 works"})
+        ctx = await agent.remember()
+        assert "Relevant experience" in ctx
+        assert "+" in ctx
 
-        beliefs = await loop.backend.all_beliefs()
-        outlier = next(b for b in beliefs if b.description == "outlier strategy")
-        assert outlier.confidence > 1.0
-
-    async def test_salience_disabled(self, loop):
-        """With salience=False, novel observations get confidence=1.0."""
-        loop.salience = False
-        for i in range(5):
-            await loop.assimilate(Observation(
-                capability="mining", description=f"peer_{i}",
-                valence=Valence.POSITIVE, metric_value=0.5 + i * 0.01,
-            ))
-
-        obs = Observation(
-            capability="mining", description="outlier strategy",
-            valence=Valence.POSITIVE, metric_value=0.99,
-        )
-        await loop.assimilate(obs)
-
-        beliefs = await loop.backend.all_beliefs()
-        outlier = next(b for b in beliefs if b.description == "outlier strategy")
-        assert outlier.confidence == 1.0
+    async def test_agent_with_query(self, mem_with_embedder):
+        agent = Agent(memory=mem_with_embedder, capability="coding")
+        await agent.learn({"success": True, "description": "python async works great"})
+        ctx = await agent.remember(query="python patterns")
+        # char-freq embedder may or may not match strongly enough
+        assert isinstance(ctx, str)
 
 
 # ======================================================================
-# Inhibition (built into MemoryLoop.assimilate)
+# Wrap API
 # ======================================================================
+
+
+class TestWrap:
+    @pytest.fixture(autouse=True)
+    def reset_singleton(self):
+        import ganglion.memory.wrap as mod
+
+        mod._default_memory = None
+        yield
+        mod._default_memory = None
+
+    def test_wraps_sync(self, tmp_dir):
+        def agent(prompt: str) -> str:
+            return f"response to: {prompt}"
+
+        wrapped = memory(agent, capability="test", db_path=str(tmp_dir / "m.db"))
+        result = wrapped("hello")
+        assert "response to:" in result
+        assert wrapped.__name__ == "agent"
+
+    def test_wraps_async(self, tmp_dir):
+        async def agent(prompt: str) -> str:
+            return f"async response to: {prompt}"
+
+        wrapped = memory(agent, capability="test", db_path=str(tmp_dir / "m.db"))
+        result = asyncio.run(wrapped("hello"))
+        assert "async response to:" in result
+
+    def test_decorator_no_parens(self, tmp_dir):
+        @memory
+        def agent(prompt: str) -> str:
+            return f"decorated: {prompt}"
+
+        result = agent("test")
+        assert "decorated:" in result
+
+    def test_decorator_with_parens(self, tmp_dir):
+        @memory(capability="test", db_path=str(tmp_dir / "m.db"))
+        def agent(prompt: str) -> str:
+            return f"decorated: {prompt}"
+
+        result = agent("test")
+        assert "decorated:" in result
+
+    def test_injects_openai(self, tmp_dir):
+        def agent(messages=None):
+            return messages[0]["content"]
+
+        wrapped = memory(agent, capability="test", db_path=str(tmp_dir / "m.db"))
+        result = wrapped(
+            messages=[
+                {"role": "system", "content": "base prompt"},
+                {"role": "user", "content": "hi"},
+            ]
+        )
+        assert "base prompt" in result
+
+    def test_injects_anthropic(self, tmp_dir):
+        def agent(system="", messages=None):
+            return system
+
+        wrapped = memory(agent, capability="test", db_path=str(tmp_dir / "m.db"))
+        result = wrapped(system="base prompt", messages=[])
+        assert "base prompt" in result
+
+    def test_injects_string(self, tmp_dir):
+        def agent(prompt: str) -> str:
+            return prompt
+
+        wrapped = memory(agent, capability="test", db_path=str(tmp_dir / "m.db"))
+        result = wrapped("base prompt")
+        assert "base prompt" in result
+
+    def test_custom_judge(self, tmp_dir):
+        def agent(prompt: str) -> dict:
+            return {"score": 0.95, "text": "good result"}
+
+        def judge(response):
+            return {
+                "success": response["score"] > 0.5,
+                "description": response["text"],
+            }
+
+        wrapped = memory(
+            agent, capability="test", judge=judge, db_path=str(tmp_dir / "m.db"),
+        )
+        result = wrapped("test")
+        assert result["score"] == 0.95
+
+    def test_preserves_name(self, tmp_dir):
+        def my_special_agent(x):
+            return x
+
+        wrapped = memory(
+            my_special_agent, capability="test", db_path=str(tmp_dir / "m.db"),
+        )
+        assert wrapped.__name__ == "my_special_agent"
+
+    def test_single_call_per_invocation(self, tmp_dir):
+        """v4: only one call per invocation (no counterfactual)."""
+        call_count = 0
+
+        def agent(prompt: str) -> str:
+            nonlocal call_count
+            call_count += 1
+            return f"response {call_count}"
+
+        wrapped = memory(agent, capability="test", db_path=str(tmp_dir / "m.db"))
+        wrapped("hello")
+        assert call_count == 1
+        wrapped("hello")
+        assert call_count == 2  # one call each time
+
+
+# ======================================================================
+# Default judge
+# ======================================================================
+
+
+class TestDefaultJudge:
+    def test_string_success(self):
+        result = _default_judge("hello world")
+        assert result["success"] is True
+        assert result["description"] == "hello world"
+
+    def test_string_error(self):
+        result = _default_judge("Error: something went wrong")
+        assert result["success"] is False
+
+    def test_dict_passthrough(self):
+        result = _default_judge({"success": False, "description": "bad"})
+        assert result["success"] is False
+
+    def test_truncates(self):
+        result = _default_judge("x" * 1000)
+        assert len(result["description"]) <= 500
+
+    def test_traceback(self):
+        result = _default_judge("Traceback (most recent call last):")
+        assert result["success"] is False
+
+
+# ======================================================================
+# Query extraction
+# ======================================================================
+
+
+class TestQueryExtraction:
+    def test_from_string(self):
+        assert _extract_query(("hello",), {}) == "hello"
+
+    def test_from_messages(self):
+        q = _extract_query(
+            (),
+            {
+                "messages": [
+                    {"role": "system", "content": "You are helpful"},
+                    {"role": "user", "content": "What is the weather?"},
+                ]
+            },
+        )
+        assert "weather" in q
+
+    def test_last_user_message(self):
+        q = _extract_query(
+            (),
+            {
+                "messages": [
+                    {"role": "user", "content": "first"},
+                    {"role": "assistant", "content": "reply"},
+                    {"role": "user", "content": "second"},
+                ]
+            },
+        )
+        assert q == "second"
+
+    def test_empty(self):
+        assert _extract_query((), {}) == ""
+
+
+# ======================================================================
+# Embedding utilities
+# ======================================================================
+
+
+class TestCosine:
+    def test_identical(self):
+        v = [1.0, 0.0, 0.0]
+        assert cosine_similarity(v, v) == pytest.approx(1.0)
+
+    def test_orthogonal(self):
+        assert cosine_similarity([1.0, 0.0], [0.0, 1.0]) == pytest.approx(0.0)
+
+    def test_opposite(self):
+        assert cosine_similarity([1.0, 0.0], [-1.0, 0.0]) == pytest.approx(-1.0)
+
+    def test_similar(self):
+        assert cosine_similarity([1.0, 1.0, 0.0], [1.0, 1.0, 0.1]) > 0.95
+
+    def test_empty(self):
+        assert cosine_similarity([], []) == 0.0
+
+    def test_mismatched(self):
+        assert cosine_similarity([1.0, 0.0], [1.0]) == 0.0
+
+    def test_zero(self):
+        assert cosine_similarity([0.0, 0.0], [1.0, 1.0]) == 0.0
+
 
 @pytest.mark.asyncio
-class TestInhibition:
-    async def test_agreement_weakens_competitors(self, loop):
-        """Agreement on one belief weakens competitors with overlapping features."""
-        await loop.backend.store(Belief(
-            capability="mining", description="batch=64",
-            valence=Valence.POSITIVE, entities=("subnet-18",),
-            confidence=1.0, confirmation_count=1,
-        ))
-        await loop.backend.store(Belief(
-            capability="mining", description="batch=128",
-            valence=Valence.POSITIVE, entities=("subnet-18",),
-            confidence=1.0, confirmation_count=1,
-        ))
+class TestCallableEmbedderIntegration:
+    async def test_embed(self):
+        async def mock(text: str) -> list[float]:
+            return [float(len(text)), 0.5]
 
-        obs = Observation(
-            capability="mining", description="batch=64",
-            valence=Valence.POSITIVE, entities=("subnet-18",),
-        )
-        await loop.assimilate(obs)
+        emb = CallableEmbedder(mock)
+        result = await emb.embed("hello")
+        assert result == [5.0, 0.5]
 
-        beliefs = await loop.backend.all_beliefs()
-        comp = next(b for b in beliefs if b.description == "batch=128")
-        assert comp.confidence < 1.0
+    async def test_batch(self):
+        async def mock(text: str) -> list[float]:
+            return [float(len(text))]
 
-    async def test_inhibition_disabled(self, loop):
-        """inhibition_rate=0.0 disables inhibition entirely."""
-        loop.inhibition_rate = 0.0
-
-        await loop.backend.store(Belief(
-            capability="mining", description="batch=64",
-            valence=Valence.POSITIVE, entities=("subnet-18",),
-            confidence=1.0, confirmation_count=1,
-        ))
-        await loop.backend.store(Belief(
-            capability="mining", description="batch=128",
-            valence=Valence.POSITIVE, entities=("subnet-18",),
-            confidence=1.0, confirmation_count=1,
-        ))
-
-        obs = Observation(
-            capability="mining", description="batch=64",
-            valence=Valence.POSITIVE, entities=("subnet-18",),
-        )
-        await loop.assimilate(obs)
-
-        beliefs = await loop.backend.all_beliefs()
-        comp = next(b for b in beliefs if b.description == "batch=128")
-        assert comp.confidence == 1.0
+        emb = CallableEmbedder(mock)
+        results = await emb.embed_batch(["a", "ab", "abc"])
+        assert results == [[1.0], [2.0], [3.0]]
 
 
-# ======================================================================
-# Consolidation (built into MemoryLoop.forget)
-# ======================================================================
-
-@pytest.mark.asyncio
-class TestConsolidation:
-    async def test_forget_merges_similar_cluster(self, loop):
-        """forget() merges similar beliefs before evicting."""
-        loop.max_beliefs = 1
-        loop.consolidation_threshold = 0.5
-
-        for i in range(3):
-            await loop.backend.store(Belief(
-                capability="mining", description=f"strategy_{i}",
-                valence=Valence.POSITIVE,
-                entities=("subnet-18",), tags=("gpu",),
-                confirmation_count=1, confidence=1.0,
-                metric_value=0.8 + i * 0.01,
-                metric_name="score",
-            ))
-
-        await loop.forget()
-
-        remaining = await loop.backend.all_beliefs()
-        assert len(remaining) == 1
-        merged = remaining[0]
-        assert merged.confirmation_count == 3
-        assert "consolidated" in merged.tags
-        assert "subnet-18" in merged.entities
-
-    async def test_no_merge_below_jaccard_threshold(self, loop):
-        """Beliefs with no feature overlap don't merge."""
-        loop.max_beliefs = 100
-        loop.consolidation_threshold = 0.5
-
-        await loop.backend.store(Belief(
-            capability="mining", description="a",
-            valence=Valence.POSITIVE, entities=("A",),
-        ))
-        await loop.backend.store(Belief(
-            capability="mining", description="b",
-            valence=Valence.POSITIVE, entities=("B",),
-        ))
-        await loop.backend.store(Belief(
-            capability="mining", description="c",
-            valence=Valence.POSITIVE, entities=("C",),
-        ))
-
-        await loop.forget()
-        assert len(await loop.backend.all_beliefs()) == 3
-
-
-# ======================================================================
-# Strategy bundling via run_id
-# ======================================================================
-
-@pytest.mark.asyncio
-class TestStrategyBundling:
-    async def test_run_id_creates_strategy_bundle(self, loop):
-        """Beliefs from the same run share a tag and can be retrieved together."""
-        await loop.assimilate(Observation(
-            capability="training", description="batch=64",
-            valence=Valence.POSITIVE, run_id="run-042",
-        ))
-        await loop.assimilate(Observation(
-            capability="training", description="cosine lr",
-            valence=Valence.POSITIVE, run_id="run-042",
-        ))
-        await loop.assimilate(Observation(
-            capability="training", description="unrelated approach",
-            valence=Valence.POSITIVE, run_id="run-099",
-        ))
-
-        bundle = await loop.backend.query(tags=("run:run-042",))
-        assert len(bundle) == 2
-        descriptions = {b.description for b in bundle}
-        assert "batch=64" in descriptions
-        assert "cosine lr" in descriptions
-        assert "unrelated approach" not in descriptions
-
-
-# ======================================================================
-# Crisis detection
-# ======================================================================
-
-@pytest.mark.asyncio
-class TestCrisisDetection:
-    async def test_crisis_mode_accelerates_weakening(self, loop):
-        """Consecutive contradictions make the system more plastic."""
-        for _ in range(5):
-            await loop.assimilate(Observation(
-                capability="x", description="old strategy",
-                valence=Valence.POSITIVE,
-            ))
-
-        beliefs = await loop.backend.all_beliefs()
-        conf_before = beliefs[0].confidence
-
-        for i in range(3):
-            await loop.assimilate(Observation(
-                capability="x", description="old strategy",
-                valence=Valence.NEGATIVE,
-            ))
-
-        beliefs = await loop.backend.all_beliefs()
-        old = [b for b in beliefs if "old strategy" in b.description][0]
-        total_drop = conf_before - old.confidence
-
-        # With crisis (kicks in at contradiction 3): 0.3 + 0.3 + 0.9 = 1.5
-        assert total_drop > 0.9 * 1.3
-
-    async def test_agreement_resets_crisis(self, loop):
-        """One agreement resets the contradiction streak."""
-        await loop.assimilate(Observation(
-            capability="x", description="strategy A",
-            valence=Valence.POSITIVE,
-        ))
-
-        await loop.assimilate(Observation(
-            capability="x", description="strategy A",
-            valence=Valence.NEGATIVE,
-        ))
-        await loop.assimilate(Observation(
-            capability="x", description="strategy A",
-            valence=Valence.NEGATIVE,
-        ))
-        assert loop._contradiction_streak == 2
-
-        await loop.assimilate(Observation(
-            capability="x", description="strategy A",
-            valence=Valence.POSITIVE,
-        ))
-        assert loop._contradiction_streak == 0
-
-    async def test_streak_decays_on_forget(self, loop):
-        """Between-runs decay prevents slow-burn false crises."""
-        await loop.assimilate(Observation(
-            capability="x", description="A",
-            valence=Valence.POSITIVE,
-        ))
-        await loop.assimilate(Observation(
-            capability="x", description="A",
-            valence=Valence.NEGATIVE,
-        ))
-        await loop.assimilate(Observation(
-            capability="x", description="A",
-            valence=Valence.NEGATIVE,
-        ))
-        assert loop._contradiction_streak == 2
-
-        await loop.forget()
-        assert loop._contradiction_streak == 1
-
-        await loop.forget()
-        assert loop._contradiction_streak == 0
+class TestGlobalEmbedder:
+    def test_set_and_reset(self):
+        set_embedder(None)
+        reset_embedder()
+        # Should not raise

@@ -1,157 +1,83 @@
 """
-Core types for Ganglion's memory system.
+Core type for Ganglion Memory v4.
 
-Three types replace seven:
-    Observation — everything that enters the system
-    Belief      — everything the system remembers
-    Delta       — everything the system notices changing
+One type replaces three:
+    Experience — replaces Observation, Belief, and Delta.
+
+No valence, no confidence scoring, no biological metaphors.
+Just content, tags, counts, and an optional embedding.
 """
 
 from __future__ import annotations
 
+import base64
+import struct
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from enum import Enum
 from typing import Any
 
 
-class Valence(str, Enum):
-    """Did this work or fail?"""
+@dataclass
+class Experience:
+    """The universal memory unit.
 
-    POSITIVE = "positive"
-    NEGATIVE = "negative"
-    NEUTRAL = "neutral"
+    Everything stored in memory is an Experience. No patterns, no
+    antipatterns, no beliefs, no observations, no deltas. Just
+    experiences with raw confirmation/contradiction counts.
 
-
-@dataclass(frozen=True, slots=True)
-class Observation:
-    """The universal input. Everything enters memory as this.
-
-    A mining run, a config change, a subnet shift, an agent design —
-    all are observations. Replaces the old Pattern/Antipattern/
-    AgentDesignPattern split.
-    """
-
-    capability: str
-    description: str
-    valence: Valence
-    entities: tuple[str, ...] = ()
-    config: dict[str, Any] | None = None
-    metric_name: str | None = None
-    metric_value: float | None = None
-    source: str | None = None
-    run_id: str | None = None
-    tags: tuple[str, ...] = ()
-    timestamp: datetime = field(default_factory=lambda: datetime.now(UTC))
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "capability": self.capability,
-            "description": self.description,
-            "valence": self.valence.value,
-            "entities": list(self.entities),
-            "config": self.config,
-            "metric_name": self.metric_name,
-            "metric_value": self.metric_value,
-            "source": self.source,
-            "run_id": self.run_id,
-            "tags": list(self.tags),
-            "timestamp": self.timestamp.isoformat(),
-        }
-
-
-@dataclass(slots=True)
-class Belief:
-    """The universal storage unit.
-
-    A pattern is a belief with positive valence.
-    An antipattern is a belief with negative valence.
-    An agent design is a belief tagged "agent_design".
-
-    No separate types, no separate tables, no separate queries.
+    Attributes:
+        id:                   Database-assigned identifier.
+        content:              The memory text — what happened or was learned.
+        tags:                 Searchable labels (capability, outcome, domain, ...).
+        source:               Who created this (bot_id, user, system, ...).
+        created_at:           When first stored.
+        updated_at:           When last modified (confirm/contradict/rewrite).
+        confirmation_count:   How many times this was confirmed or re-observed.
+        contradiction_count:  How many times this was contradicted.
+        embedding:            Optional vector for semantic search.
+        metadata:             Arbitrary key/value data (input_text, output_text,
+                              metric_name, metric_value, config, ...).
     """
 
     id: int | None = None
-    capability: str = ""
-    description: str = ""
-    valence: Valence = Valence.NEUTRAL
-    confidence: float = 1.0
-    confirmation_count: int = 1
-    entities: tuple[str, ...] = ()
-    config: dict[str, Any] | None = None
-    metric_name: str | None = None
-    metric_value: float | None = None
-    last_metric_value: float | None = None
-    source: str | None = None
-    first_seen: datetime = field(default_factory=lambda: datetime.now(UTC))
-    last_confirmed: datetime = field(default_factory=lambda: datetime.now(UTC))
-    last_retrieved: datetime | None = None
-    superseded_by: str | None = None
+    content: str = ""
     tags: tuple[str, ...] = ()
+    source: str = ""
+    created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+    updated_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+    confirmation_count: int = 0
+    contradiction_count: int = 0
     embedding: list[float] | None = None
-    produced_with: tuple[int, ...] = ()  # IDs of beliefs retrieved when this was created
-    input_context: str = ""  # the task/query that produced this belief
+    metadata: dict[str, Any] | None = None
 
     @property
-    def is_pattern(self) -> bool:
-        return self.valence == Valence.POSITIVE
-
-    @property
-    def is_antipattern(self) -> bool:
-        return self.valence == Valence.NEGATIVE
-
-    @property
-    def strength(self) -> float:
-        """Composite score: confirmation × recency × confidence.
-
-        Beliefs confirmed more than `consolidation_threshold` times are
-        considered consolidated into long-term memory and receive a
-        recency floor, preventing eviction of well-established knowledge.
-        """
-        recency_hours = (datetime.now(UTC) - self.last_confirmed).total_seconds() / 3600
-        recency_factor = 1.0 / (1.0 + recency_hours / 168.0)
-
-        # Long-term memory consolidation: highly confirmed beliefs
-        # get a recency floor so they don't decay away
-        consolidation_threshold = 5
-        if self.confirmation_count >= consolidation_threshold:
-            recency_floor = 0.5
-            recency_factor = max(recency_factor, recency_floor)
-
-        return self.confidence * self.confirmation_count * recency_factor
+    def net_score(self) -> int:
+        """Confirmations minus contradictions. Positive = trustworthy."""
+        return self.confirmation_count - self.contradiction_count
 
     def to_dict(self) -> dict[str, Any]:
+        """Serialize to a plain dict. Embedding stored as base64 float blob."""
         d: dict[str, Any] = {
             "id": self.id,
-            "capability": self.capability,
-            "description": self.description,
-            "valence": self.valence.value,
-            "confidence": self.confidence,
-            "confirmation_count": self.confirmation_count,
-            "entities": list(self.entities),
-            "config": self.config,
-            "metric_name": self.metric_name,
-            "metric_value": self.metric_value,
-            "last_metric_value": self.last_metric_value,
-            "source": self.source,
-            "first_seen": self.first_seen.isoformat(),
-            "last_confirmed": self.last_confirmed.isoformat(),
-            "last_retrieved": self.last_retrieved.isoformat() if self.last_retrieved else None,
-            "superseded_by": self.superseded_by,
+            "content": self.content,
             "tags": list(self.tags),
+            "source": self.source,
+            "created_at": self.created_at.isoformat(),
+            "updated_at": self.updated_at.isoformat(),
+            "confirmation_count": self.confirmation_count,
+            "contradiction_count": self.contradiction_count,
+            "metadata": self.metadata,
         }
         if self.embedding is not None:
-            import base64
-            import struct
             d["embedding"] = base64.b64encode(
                 struct.pack(f"{len(self.embedding)}f", *self.embedding)
             ).decode("ascii")
-        d["produced_with"] = list(self.produced_with)
-        d["input_context"] = self.input_context
         return d
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> Belief:
+    def from_dict(cls, data: dict[str, Any]) -> Experience:
+        """Deserialize from a plain dict."""
+
         def _parse_dt(val: Any) -> datetime:
             if isinstance(val, str):
                 return datetime.fromisoformat(val)
@@ -161,60 +87,19 @@ class Belief:
 
         embedding = None
         if data.get("embedding"):
-            import base64
-            import struct
             raw = base64.b64decode(data["embedding"])
             count = len(raw) // 4
             embedding = list(struct.unpack(f"{count}f", raw))
 
         return cls(
             id=data.get("id"),
-            capability=data.get("capability", ""),
-            description=data.get("description", ""),
-            valence=Valence(data.get("valence", "neutral")),
-            confidence=data.get("confidence", 1.0),
-            confirmation_count=data.get("confirmation_count", 1),
-            entities=tuple(data.get("entities", ())),
-            config=data.get("config"),
-            metric_name=data.get("metric_name"),
-            metric_value=data.get("metric_value"),
-            last_metric_value=data.get("last_metric_value"),
-            source=data.get("source"),
-            first_seen=_parse_dt(data.get("first_seen")),
-            last_confirmed=_parse_dt(data.get("last_confirmed")),
-            last_retrieved=_parse_dt(data["last_retrieved"]) if data.get("last_retrieved") else None,
-            superseded_by=data.get("superseded_by"),
+            content=data.get("content", ""),
             tags=tuple(data.get("tags", ())),
+            source=data.get("source", ""),
+            created_at=_parse_dt(data.get("created_at")),
+            updated_at=_parse_dt(data.get("updated_at")),
+            confirmation_count=data.get("confirmation_count", 0),
+            contradiction_count=data.get("contradiction_count", 0),
             embedding=embedding,
-            produced_with=tuple(data.get("produced_with", ())),
-            input_context=data.get("input_context", ""),
-        )
-
-
-@dataclass(frozen=True, slots=True)
-class Delta:
-    """Emitted when the system detects a meaningful change.
-
-    The prediction-error signal. Consumers can log it, alert on it,
-    or feed it into the next run's planning phase.
-    """
-
-    old_belief: Belief
-    new_observation: Observation
-    delta_type: str  # "metric_shift", "contradiction"
-    magnitude: float | None = None
-
-    @property
-    def summary(self) -> str:
-        if self.delta_type == "metric_shift" and self.magnitude is not None:
-            return (
-                f"{self.old_belief.capability}: "
-                f"{self.old_belief.metric_name} shifted "
-                f"{self.old_belief.metric_value} → {self.new_observation.metric_value} "
-                f"({self.magnitude:+.0%})"
-            )
-        return (
-            f"{self.old_belief.capability}: "
-            f"'{self.old_belief.description}' contradicted by "
-            f"'{self.new_observation.description}'"
+            metadata=data.get("metadata"),
         )

@@ -1,6 +1,6 @@
 # ganglion-memory
 
-Biological memory for agents. One line to add, zero lines to change.
+Dumb memory, smart retrieval — let the LLM think.
 
 ## Quick start
 
@@ -14,168 +14,124 @@ from ganglion.memory import memory
 agent = memory(agent)
 ```
 
-Your agent now accumulates knowledge across runs. What worked gets strengthened. What failed gets recorded. Contradictions get detected. The strongest beliefs surface first in prompts.
+Your agent now accumulates experience across runs. One call per invocation — no counterfactual evaluation, no double-call. Before each call, relevant experience is injected into the prompt. After each call, the outcome is stored.
 
 ## How it works
 
-Before each call, `memory()` injects accumulated knowledge into your agent's system prompt. After each call, it evaluates the response and feeds the outcome back. The agent itself never changes.
+One type: **Experience**. No Observation/Belief/Delta split. No confidence scoring. No biological metaphors. Just content, tags, confirmation/contradiction counts, and an optional embedding vector.
 
 ```python
-from openai import OpenAI
+from ganglion.memory import Memory, SqliteBackend
+
+mem = Memory(backend=SqliteBackend("memory.db"))
+
+# Store
+exp = await mem.add("batch_size=64 works well", tags=("mining",))
+
+# Search
+results = await mem.search("what batch size?", tags=("mining",))
+
+# Confirm / Contradict
+await mem.confirm(exp.id)
+await mem.contradict(exp.id)
+
+# Compress similar experiences
+await mem.compress(tags=("mining",))
+```
+
+## Agent wrapper
+
+Three touch points, any agent, any task:
+
+```python
+from ganglion.memory import Memory, Agent, SqliteBackend
+
+mem = Memory(backend=SqliteBackend("memory.db"))
+agent = Agent(memory=mem, capability="mining", bot_id="alpha")
+
+# 1. BEFORE acting — inject context into prompt
+context = await agent.remember(query="optimize batch size")
+
+# 2. AFTER acting — store the outcome
+exp = await agent.learn(result_dict, input_text="...", output_text="...")
+
+# 3. BETWEEN runs — compress similar experiences
+await agent.between_runs()
+```
+
+## One-line wrapper
+
+```python
 from ganglion.memory import memory
 
-client = OpenAI()
-
+@memory
 def ask(question: str) -> str:
-    response = client.chat.completions.create(
+    return client.chat.completions.create(
         model="gpt-4o",
         messages=[
-            {"role": "system", "content": "You are a research assistant."},
+            {"role": "system", "content": "You are helpful."},
             {"role": "user", "content": question},
         ],
-    )
-    return response.choices[0].message.content
+    ).choices[0].message.content
 
-ask = memory(ask)
 ask("What batch size should I use?")
 ```
 
-Works with OpenAI, Anthropic, or any function that takes a prompt and returns a response. Works as a decorator:
-
-```python
-@memory
-def review(code: str) -> str:
-    ...
-```
+Works with OpenAI, Anthropic, or any function that takes a prompt and returns a response.
 
 ## Configuration
 
 ```python
 agent = memory(
     agent,
-    capability="mining",        # what domain (groups beliefs)
-    bot_id="alpha",             # unique agent id (for cross-agent learning)
-    db_path="memory.db",        # where to store beliefs
-    judge=my_judge_fn,          # custom success/failure evaluation
+    capability="mining",     # domain grouping
+    bot_id="alpha",          # unique agent id
+    db_path="memory.db",     # SQLite path
+    judge=my_judge_fn,       # custom success/failure evaluation
+    embedder=my_embedder,    # custom embedding function
 )
 ```
 
-## Custom judge
+## ReMem-style refine tools
 
-By default, the wrapper auto-detects OpenAI and Anthropic response types and records them as successful. For domain-specific evaluation:
-
-```python
-def my_judge(response) -> dict:
-    score = extract_score(response)
-    return {
-        "success": score > 0.5,
-        "description": f"Got score {score}",
-        "metric_name": "accuracy",
-        "metric_value": score,
-    }
-
-agent = memory(agent, judge=my_judge)
-```
-
-The judge returns a dict with `success` (required) and optionally `description`, `metric_name`, `metric_value`, `config`, `tags`, `error`.
-
-## Full API
-
-For more control, use the components directly:
+Opt-in tools for LLM-driven memory management:
 
 ```python
-from ganglion.memory import MemoryLoop, MemoryAgent, SqliteMemoryBackend, between_runs
-
-# Create the memory store
-mem = MemoryLoop(backend=SqliteMemoryBackend("memory.db"))
-
-# Create a memory-aware agent wrapper
-agent = MemoryAgent(memory=mem, capability="mining", bot_id="alpha")
-
-# Three touch points:
-context = await agent.remember()           # before — inject into prompt
-result = await your_agent.run(context)     # act — unchanged
-delta = await agent.learn(result_dict)     # after — feed outcome back
-
-# Between runs — consolidate and forget
-await between_runs(mem)
-```
-
-## MemoryLoop parameters
-
-```python
-MemoryLoop(
-    backend=SqliteMemoryBackend("memory.db"),
-    strengthen_rate=0.1,          # confidence boost on agreement
-    weaken_rate=0.3,              # confidence reduction on contradiction
-    death_threshold=0.1,          # beliefs below this die
-    metric_shift_threshold=0.15,  # fractional change to count as drift
-    max_beliefs=1000,             # capacity before eviction
-    salience=True,                # surprise-gated encoding strength
-    inhibition_rate=0.05,         # lateral inhibition between competitors
-    inhibition_floor=0.2,         # inhibition can't kill, only weaken
-    exploration_rate=0.0,         # noise on retrieval ranking (0 = deterministic)
-    cross_agent_bonus=2.0,        # independent replication worth 2x self-confirmation
-    crisis_multiplier=3.0,        # plasticity boost on consecutive contradictions
-    consolidation_threshold=0.5,  # Jaccard threshold for merging similar beliefs
+from ganglion.memory.refine import (
+    merge_experiences,
+    split_experience,
+    rewrite_experience,
+    forget_experience,
 )
+
+# LLM decides two experiences should be merged
+merged = await merge_experiences(mem, [exp1.id, exp2.id], "combined insight")
+
+# LLM splits a compound experience
+parts = await split_experience(mem, exp.id, ["fact A", "fact B"])
+
+# LLM rewrites stale memory
+updated = await rewrite_experience(mem, exp.id, "corrected understanding")
+
+# LLM decides to forget
+await forget_experience(mem, exp.id)
 ```
 
-## Backends
+## What changed from v3
 
-```python
-from ganglion.memory import SqliteMemoryBackend, JsonMemoryBackend, FederatedMemoryBackend, PeerDiscovery
+- **One type**: Experience replaces Observation/Belief/Delta
+- **No biological metaphors**: No Hebbian strengthening, lateral inhibition, apoptosis, or crisis detection
+- **No counterfactual evaluation**: One LLM call per invocation (not two)
+- **No confidence scoring**: Raw confirmation/contradiction counts — let the LLM interpret
+- **Embedding-based retrieval** with optional LLM synthesis on compress
+- **ReMem-inspired refine tools** for active memory editing (opt-in)
 
-# SQLite — production use, one table, indexed
-backend = SqliteMemoryBackend("memory.db")
+## What stayed
 
-# JSON — development, one file
-backend = JsonMemoryBackend("./memory/")
-
-# Federated — multi-agent on shared filesystem
-local = JsonMemoryBackend(f"/shared/bots/{bot_id}")
-backend = FederatedMemoryBackend(local, PeerDiscovery("/shared/bots", bot_id))
-```
-
-## Cortex — advanced retrieval
-
-```python
-from ganglion.memory.cortex import spread_activation, temporal_neighbors
-
-# Find beliefs associated with a seed through shared entities/tags
-related = await spread_activation(seed_belief, backend, max_hops=1, limit=10)
-
-# Find beliefs from the same time period
-neighbors = await temporal_neighbors(belief, backend, window=timedelta(hours=1))
-```
-
-## Biology
-
-The system implements five biological memory mechanisms:
-
-* **Hebbian strengthening** — repeated confirmation increases belief strength
-* **Apoptosis** — beliefs contradicted enough times die and get replaced
-* **Salience** — surprising observations encode with higher initial strength
-* **Lateral inhibition** — strengthening one strategy weakens alternatives
-* **Consolidation** — similar beliefs merge into meta-beliefs during the sleep phase (between runs)
-
-Three emergence mechanisms:
-
-* **Cross-agent confirmation** — independent replication weighted higher than self-confirmation
-* **Exploration pressure** — Gaussian noise on retrieval prevents premature convergence
-* **Strategy bundling** — beliefs from the same run are tagged for coherent retrieval
-
-One adaptation mechanism:
-
-* **Crisis detection** — consecutive contradictions temporarily increase plasticity
-
-## Types
-
-Three types:
-
-* **Observation** — everything that enters memory (capability, description, valence, entities, tags, metrics)
-* **Belief** — everything memory stores (observation fields + confidence, confirmation_count, strength)
-* **Delta** — everything memory notices changing (contradiction or metric shift)
+- `memory(fn)` one-line wrapper still works
+- `SqliteBackend` with embedding blob storage
+- `Embedder` protocol (SentenceTransformer, CallableEmbedder)
+- Agent wrapper with remember/learn/between_runs
 
 ## License
 

@@ -1,8 +1,12 @@
 """Embedding protocol and implementations for semantic similarity.
 
-Replaces Jaccard bag-of-words matching with vector embeddings.
 Default: sentence-transformers (all-MiniLM-L6-v2, ~80MB).
-Fallback: None (Jaccard similarity used when no embedder available).
+Fallback: None (tag-based query when no embedder available).
+
+Three implementations:
+    SentenceTransformerEmbedder — local model, lazy-loaded.
+    CallableEmbedder            — wrap any async function.
+    get_embedder / set_embedder — global singleton management.
 """
 
 from __future__ import annotations
@@ -28,7 +32,7 @@ class Embedder(Protocol):
 
 
 def cosine_similarity(a: list[float], b: list[float]) -> float:
-    """Cosine similarity between two vectors."""
+    """Cosine similarity between two vectors. Returns 0.0 on degenerate input."""
     if len(a) != len(b) or not a:
         return 0.0
     dot = sum(x * y for x, y in zip(a, b))
@@ -53,6 +57,7 @@ class SentenceTransformerEmbedder:
         if self._model is None:
             try:
                 from sentence_transformers import SentenceTransformer
+
                 self._model = SentenceTransformer(self._model_name)
             except ImportError:
                 raise ImportError(
@@ -71,10 +76,12 @@ class SentenceTransformerEmbedder:
 
     async def embed(self, text: str) -> list[float]:
         import asyncio
+
         return await asyncio.to_thread(self._embed_sync, text)
 
     async def embed_batch(self, texts: list[str]) -> list[list[float]]:
         import asyncio
+
         if not texts:
             return []
         return await asyncio.to_thread(self._embed_batch_sync, texts)
@@ -107,7 +114,6 @@ def get_embedder() -> Embedder | None:
         return _default_embedder
     try:
         _default_embedder = SentenceTransformerEmbedder()
-        # Test that it can load
         _default_embedder._get_model()
         return _default_embedder
     except (ImportError, Exception) as e:
